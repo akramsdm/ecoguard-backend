@@ -27,9 +27,13 @@ class Settings(BaseSettings):
     s3_region: str = 'us-east-1'
     s3_access_key: str | None = None
     s3_secret_key: str | None = None
-    model_path: str | None = None
-    model_labels_path: str | None = None
-    model_version: str = 'not-configured'
+    image_assistance: Literal['auto', 'disabled'] = 'auto'
+    speciesnet_model: str = 'kaggle:google/speciesnet/pyTorch/v4.0.3b/1'
+    speciesnet_local_dir: str | None = None
+    speciesnet_cache_dir: str = './var/models'
+    speciesnet_device: str | None = None
+    speciesnet_warmup: bool = True
+    model_version: str = ''
     confidence_threshold: float = .75
     sms_provider: Literal['disabled', 'webhook'] = 'disabled'
     sms_webhook_url: str | None = None
@@ -41,6 +45,10 @@ class Settings(BaseSettings):
     @property
     def origins(self):
         return [o.strip().rstrip('/') for o in self.allowed_origins.split(',') if o.strip()]
+
+    @property
+    def ai_enabled(self):
+        return self.image_assistance != 'disabled'
 
     @model_validator(mode='after')
     def production_guard(self):

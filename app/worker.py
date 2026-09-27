@@ -1,6 +1,8 @@
 from celery import Celery
 from .config import get_settings
+from .logging_config import configure as configure_logging
 
+configure_logging()
 celery_app=Celery('ecoguard',broker=get_settings().redis_url,backend=get_settings().redis_url)
 celery_app.conf.update(task_serializer='json',accept_content=['json'],result_serializer='json',
     task_acks_late=True,worker_prefetch_multiplier=1,broker_connection_retry_on_startup=True,

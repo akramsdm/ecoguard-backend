@@ -9,6 +9,7 @@ from .schemas import PredictionWrite
 from .config import get_settings
 from .security import current_user, evidence_access, audit
 from . import storage
+from . import ai
 
 router=APIRouter(tags=['Private evidence and image assistance'])
 
@@ -56,10 +57,11 @@ def content(evidence_id:str,user:User=Depends(current_user),db:Session=Depends(g
 @router.post('/predictions',status_code=202)
 def request_prediction(payload:PredictionWrite,user:User=Depends(current_user),db:Session=Depends(get_db)):
     e=evidence_access(db,user,payload.evidence_id)
+    version=ai.resolve_model_version()
     # Reuse the most recent job for unchanged evidence/model; no fake results.
-    existing=db.query(Prediction).filter_by(evidence_id=e.id,model_version=get_settings().model_version).order_by(Prediction.created_at.desc()).first()
+    existing=db.query(Prediction).filter_by(evidence_id=e.id,model_version=version).order_by(Prediction.created_at.desc()).first()
     if existing and existing.state not in ('failed',):return prediction_view(existing)
-    p=Prediction(evidence_id=e.id,model_version=get_settings().model_version)
+    p=Prediction(evidence_id=e.id,model_version=version)
     db.add(p);db.flush()
     job=Outbox(kind='prediction',aggregate_id=p.id,dedupe_key='prediction:'+p.id);db.add(job)
     audit(db,user,'prediction.requested',p.id);db.commit()

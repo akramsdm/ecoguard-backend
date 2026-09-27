@@ -1,4 +1,17 @@
-# Install only in the model worker after choosing the appropriate CPU/GPU wheels.
--r requirements.txt
-torch==2.8.0
-torchvision==0.23.0
+# Machine-learning extras for image assistance (SpeciesNet whole-image classifier, CPU).
+#
+# Only needed when IMAGE_ASSISTANCE is enabled. The core application and the automated
+# test suite run without this file: the classifier is imported lazily and unit tests stub
+# it, so a deployment without these wheels reports `degraded` rather than failing to start.
+#
+# Python: SpeciesNet 5.0.5 requires >=3.9,<3.14.
+# Licence: SpeciesNet is Apache-2.0; the weights it downloads are published by Google on
+# Kaggle under CC-BY-4.0. See docs/AI.md.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.9.1+cpu
+torchvision==0.24.1+cpu
+speciesnet==5.0.5
+
+# speciesnet's own dependency chain imports yolov5, which calls pkg_resources. setuptools
+# 80+ warns that pkg_resources is going away, so pin below 80 to keep startup logs clean.
+setuptools==79.0.0

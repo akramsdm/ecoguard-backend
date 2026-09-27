@@ -9,6 +9,7 @@ from .schemas import UserCreate,UserAccess
 from .security import current_user,require_role,hash_password,audit,is_case_staff
 from .reports import visible_query,report_view
 from .auth import user_view
+from . import ai
 from .cache import cache
 
 router=APIRouter(tags=['Workspace, maps, administration'])
@@ -24,10 +25,14 @@ def ready(db:Session=Depends(get_db)):
 @router.get('/config')
 def config():
     cfg=get_settings()
-    return cache.cached('config',cfg.cache_ttl_seconds,lambda:
+    # Only the deployment's static fields are cached. The image-assistance state is read
+    # live on every call: a cached 'degraded' would hide a model that has just become
+    # ready, and a cached 'ready' would hide one that has failed.
+    body=cache.cached('config',cfg.cache_ttl_seconds,lambda:
         {'name':'EcoGuard Uganda','demo_enabled':cfg.demo_enabled,'application_only':True,
-        'image_assistance':'configured' if cfg.model_path and cfg.model_labels_path else 'not_configured',
         'sms':cfg.sms_provider,'max_upload_mb':cfg.max_upload_mb,'languages':['en']})
+    ai_state=ai.status()
+    return {**body,'image_assistance':ai_state['state'],'ai_model_version':ai_state['model_version']}
 
 @router.get('/areas')
 def areas(db:Session=Depends(get_db)):
@@ -135,6 +140,16 @@ def jobs(user:User=Depends(current_user),db:Session=Depends(get_db)):
     require_role(user,'admin')
     return {'items':[{'id':j.id,'kind':j.kind,'state':j.state,'attempts':j.attempts,'last_error':j.last_error,'created_at':j.created_at}
         for j in db.query(Outbox).order_by(Outbox.created_at.desc()).limit(200).all()]}
+
+# Operator-only view of why image assistance is ready, degraded or switched off.
+# The public /config response deliberately omits the reason.
+@router.get('/admin/image-assistance')
+def image_assistance_status(user:User=Depends(current_user)):
+    require_role(user,'admin')
+    state=ai.status()
+    return {'state':state['state'],'model_version':state['model_version'],'detail':state['detail'],
+        'provenance':{'package':'speciesnet','version':ai.SPECIESNET_PACKAGE_VERSION,
+            'licence':ai.SPECIESNET_LICENCE,'source':ai.SPECIESNET_SOURCE}}
 
 @router.get('/stakeholders')
 def stakeholders():

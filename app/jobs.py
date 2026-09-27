@@ -6,7 +6,14 @@ from datetime import datetime, timezone, timedelta
 from .config import get_settings
 from .db import SessionLocal
 from .models import Outbox, Prediction, Evidence, Advisory, User, now
+from .security import audit
 from . import storage
+
+
+def _prediction_owner(db, prediction):
+    """Actor for prediction audit rows: the user whose evidence was classified."""
+    e = db.get(Evidence, prediction.evidence_id)
+    return db.get(User, e.owner_id) if e else None
 
 
 def process_job(job_id):
@@ -22,6 +29,9 @@ def process_job(job_id):
                 result=infer(storage.get(e.storage_key))
                 for k,v in result.items():setattr(p,k,v)
                 job.state='done'
+                # The result is auditable: the row points at the Prediction holding
+                # state, species, confidence and model_version.
+                audit(db,db.get(User,e.owner_id),'prediction.completed',p.id)
                 from .cache import publish
                 publish({'type':'prediction.updated','object_id':p.id,'event':'prediction.updated'})
             elif job.kind=='advisory':
@@ -64,7 +74,11 @@ def process_job(job_id):
             job.last_error=f'{type(exc).__name__}: processing failed; inspect protected operator logs.'
             if job.kind=='prediction':
                 p=db.get(Prediction,job.aggregate_id)
-                if p:p.state='failed';p.explanation='Image assistance failed. Human reporting remains available.'
+                if p:
+                    p.state='failed';p.explanation='Image assistance failed. Human reporting remains available.'
+                    # Only the terminal outcome is audited; intermediate retries would
+                    # otherwise leave several rows describing a single prediction.
+                    if job.state=='failed':audit(db,_prediction_owner(db,p),'prediction.failed',p.id)
         job.updated_at=now();db.commit()
 
 

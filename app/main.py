@@ -6,12 +6,20 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.orm.exc import StaleDataError
 from .config import get_settings
 from .db import Base,engine
-from . import models,auth,reports,evidence,advisories,workspace,realtime
+from .logging_config import configure as configure_logging
+from . import models,auth,reports,evidence,advisories,workspace,realtime,ai
 
+configure_logging()
 cfg=get_settings()
 @asynccontextmanager
 async def lifespan(app):
     if cfg.auto_create_tables and cfg.app_env!='production':Base.metadata.create_all(engine)
+    if cfg.ai_enabled:
+        import threading
+        threading.Thread(target=ai.warmup,name='speciesnet-warmup',daemon=True).start()
+    else:
+        ai.log.info('[AI] image assistance disabled by configuration '
+                    '(IMAGE_ASSISTANCE=disabled); no model will be loaded.')
     yield
 
 app=FastAPI(title='EcoGuard Uganda API',version='1.0.0',

@@ -1,0 +1,82 @@
+name: ecoguard
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ecoguard
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL","pg_isready -U postgres -d ecoguard"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server","--appendonly","yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD","redis-cli","ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ecoguard-api:local
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/ecoguard
+      REDIS_URL: redis://redis:6379/0
+      ALLOWED_ORIGINS: http://localhost:5173,http://localhost:8080
+      SESSION_COOKIE: ecoguard_session
+      COOKIE_SECURE: "false"
+      SESSION_SAMESITE: lax
+      SESSION_HOURS: "12"
+      JOBS_MODE: inline
+      CACHE_TTL_SECONDS: "15"
+      STORAGE_BACKEND: local
+      MEDIA_DIR: /app/var/media
+      MAX_UPLOAD_MB: "10"
+      IMAGE_ASSISTANCE: auto
+      SPECIESNET_MODEL: kaggle:google/speciesnet/pyTorch/v4.0.3b/1
+      SPECIESNET_CACHE_DIR: /app/var/models
+      SPECIESNET_WARMUP: "true"
+      SPECIESNET_DEVICE: cpu
+      CONFIDENCE_THRESHOLD: "0.75"
+      SMS_PROVIDER: disabled
+      ENABLE_API_DOCS: "true"
+      AUTO_CREATE_TABLES: "true"
+      DEMO_ENABLED: "false"
+    ports:
+      - "8000:8000"
+    volumes:
+      - media-data:/app/var/media
+      - model-data:/app/var/models
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pg-data:
+  redis-data:
+  media-data:
+  model-data:
