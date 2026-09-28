@@ -43,7 +43,10 @@ def require_area(user, area):
         raise HTTPException(403, 'This area is not assigned to you.')
 
 def is_case_staff(user):
-    return bool(set(user.roles).intersection({'reviewer','publisher','responder'}))
+    # 'admin' is a case-staff role: staff map and advisory views accept it, and those
+    # views are fed by visible_query()/can_see_report() below. Excluding admin here while
+    # admitting it at the endpoint would yield an empty staff map instead of a usable one.
+    return bool(set(user.roles).intersection({'reviewer','publisher','responder','admin'}))
 
 def can_see_report(user, report):
     return report.owner_id == user.id or (is_case_staff(user) and report.area_id in user.areas and report.state != 'draft')

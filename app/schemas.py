@@ -37,6 +37,15 @@ class UserCreate(Register):
     roles: list[Role] = Field(default_factory=lambda: ['reporter'])
     areas: list[str] = Field(default_factory=list)
 
+class AreaCreate(Strict):
+    """A public community centroid, not a sensitive observation position."""
+    id: str = Field(pattern=r'^[a-z0-9-]{2,36}$')
+    name: str = Field(min_length=2, max_length=100)
+    description: str = Field(default='', max_length=2000)
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    radius_km: float = Field(default=10, ge=1, le=500)
+
 class ReportWrite(Strict):
     client_id: str = Field(min_length=8, max_length=64)
     category: Category

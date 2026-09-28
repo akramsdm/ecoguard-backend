@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 from .db import get_db
 from .models import User, Area, Advisory, Report, Review, Outbox, Receipt, now
 from .schemas import AdvisoryWrite, PublishWrite, RetractWrite
-from .security import current_user, require_role, require_area, report_access, check_version, audit
+from .security import current_user, require_role, require_area, report_access, check_version, audit, is_case_staff
 from .cache import touch
 
 router=APIRouter(prefix='/advisories',tags=['Reviewed advisories'])
@@ -29,7 +29,8 @@ def list_advisories(staff:bool=False,category:str|None=None,area_id:str|None=Non
     user:User=Depends(current_user),db:Session=Depends(get_db)):
     q=db.query(Advisory)
     if staff:
-        require_role(user,'publisher','reviewer','responder')
+        # Admins are included deliberately; see the note on is_case_staff in security.py.
+        require_role(user,'publisher','reviewer','responder','admin')
         q=q.filter(Advisory.area_id.in_(user.areas))
     else:
         q=q.filter(Advisory.state=='published',Advisory.expires_at>now())
@@ -55,7 +56,7 @@ def create(payload:AdvisoryWrite,user:User=Depends(current_user),db:Session=Depe
 def get_advisory(advisory_id:str,user:User=Depends(current_user),db:Session=Depends(get_db)):
     a=db.get(Advisory,advisory_id)
     if not a:raise HTTPException(404,'Advisory not found.')
-    staff=bool(set(user.roles).intersection({'reviewer','publisher','responder'})) and a.area_id in user.areas
+    staff=is_case_staff(user) and a.area_id in user.areas
     if not staff and (a.state not in ('published','retracted') or (a.state=='published' and a.expires_at<=now())):
         raise HTTPException(404,'Advisory is unavailable or expired.')
     return advisory_view(db,a,staff)

@@ -1,16 +1,16 @@
 from collections import Counter
 from fastapi import APIRouter,Depends,HTTPException,Query
-from sqlalchemy import text
+from sqlalchemy import func,text
 from sqlalchemy.orm import Session
 from .db import get_db
 from .config import get_settings
 from .models import User,Area,Report,Advisory,Audit,Outbox,LoginSession,now
-from .schemas import UserCreate,UserAccess
+from .schemas import UserCreate,UserAccess,AreaCreate
 from .security import current_user,require_role,hash_password,audit,is_case_staff
 from .reports import visible_query,report_view
 from .auth import user_view
 from . import ai
-from .cache import cache
+from .cache import cache,touch
 
 router=APIRouter(tags=['Workspace, maps, administration'])
 
@@ -20,7 +20,15 @@ def live():return {'status':'ok','service':'EcoGuard API'}
 @router.get('/health/ready')
 def ready(db:Session=Depends(get_db)):
     db.execute(text('SELECT 1'))
-    return {'status':'ok','database': 'postgresql-postgis' if db.bind.dialect.name=='postgresql' else 'sqlite-local-development'}
+    if db.bind.dialect.name!='postgresql':
+        return {'status':'ok','database':'sqlite-local-development'}
+    # The dialect alone does not prove PostGIS: a Postgres database with only plpgsql
+    # installed reports 'postgresql-postgis' under the old check. Ask the catalogue.
+    try:
+        installed=db.execute(text("SELECT 1 FROM pg_extension WHERE extname='postgis'")).first() is not None
+    except Exception:
+        installed=False
+    return {'status':'ok','database':'postgresql-postgis' if installed else 'postgresql'}
 
 @router.get('/config')
 def config():
@@ -37,7 +45,9 @@ def config():
 @router.get('/areas')
 def areas(db:Session=Depends(get_db)):
     cfg=get_settings()
-    return cache.cached('areas',cfg.cache_ttl_seconds,lambda:
+    # Key carries the 'areas:' prefix that cache.touch() invalidates, so a newly created
+    # area appears immediately instead of waiting out the TTL.
+    return cache.cached('areas:',cfg.cache_ttl_seconds,lambda:
         {'items':[{'id':a.id,'name':a.name,'description':a.description,'latitude':a.latitude,
         'longitude':a.longitude,'radius_km':a.radius_km} for a in db.query(Area).order_by(Area.name).all()]})
 
@@ -65,7 +75,10 @@ def map_data(view:str=Query('community',pattern='^(community|staff)$'),category:
     features=[]
     cfg=get_settings()
     if view=='staff':
-        require_role(user,'reviewer','responder','publisher')
+        # Admins are included deliberately: excluding them hid staff cases from the
+        # operators who manage access. This exposes other people's report titles and,
+        # for shared locations, private positions -- but only within assigned areas.
+        require_role(user,'reviewer','responder','publisher','admin')
         query=visible_query(db,user)
         if category:query=query.filter(Report.category==category)
         for r in query.limit(1000).all():
@@ -98,6 +111,53 @@ def directory(user:User=Depends(current_user),db:Session=Depends(get_db)):
     return {'items':[{'id':u.id,'name':u.name,'roles':u.roles,'areas':u.areas} for u in db.query(User).filter_by(active=True).all()
         if set(u.areas).intersection(user.areas) and set(u.roles).intersection({'reviewer','responder','publisher'})]}
 
+@router.get('/admin/dashboard')
+def admin_dashboard(user:User=Depends(current_user),db:Session=Depends(get_db)):
+    """System-wide view for access administrators.
+
+    Deliberately never cached: an administrator who acts on a warning here (assign an
+    area, retry a failed job) must see it reflected on the very next read, and a cached
+    'everything is fine' would be the one wrong answer to give.
+    """
+    require_role(user,'admin')
+    staff_roles={'reviewer','responder','publisher','admin'}
+    people=db.query(User.id,User.roles,User.areas,User.active).all()
+    roles=Counter(r for p in people for r in p.roles)
+    areas=db.query(Area.id,Area.name).order_by(Area.name).all()
+    case_staff=[p for p in people if set(p.roles)&staff_roles]
+    active_staff=[p for p in case_staff if p.active]
+    staffed={a for p in active_staff for a in p.areas}
+    unstaffed=[{'id':a,'name':n} for a,n in areas if a not in staffed]
+    reports={s:n for s,n in db.query(Report.state,func.count()).group_by(Report.state).all()}
+    categories={c:n for c,n in db.query(Report.category,func.count()).group_by(Report.category).all()}
+    advisories={s:n for s,n in db.query(Advisory.state,func.count()).group_by(Advisory.state).all()}
+    job_states={s:n for s,n in db.query(Outbox.state,func.count()).group_by(Outbox.state).all()}
+    failed=[{'id':j.id,'kind':j.kind,'attempts':j.attempts,'last_error':j.last_error,'created_at':j.created_at}
+        for j in db.query(Outbox).filter_by(state='failed').order_by(Outbox.created_at.desc()).limit(20).all()]
+    live_admins=[p for p in people if p.active and 'admin' in p.roles]
+    idle_admins=[p.id for p in live_admins if not p.areas]
+    area_less_staff=[p.id for p in active_staff if not p.areas]
+
+    attention=[]
+    if not live_admins:attention.append({'severity':'high','message':'No active administrator remains. Nobody can grant or revoke access.'})
+    if not areas:attention.append({'severity':'high','message':'No community area exists. Reports cannot be filed until one is created.'})
+    if unstaffed:attention.append({'severity':'medium','message':f'{len(unstaffed)} area(s) have no active staff assigned. Reports there cannot be reviewed.'})
+    if area_less_staff:attention.append({'severity':'medium','message':f'{len(area_less_staff)} staff account(s) have no assigned area, so their staff views are empty.'})
+    if idle_admins:attention.append({'severity':'low','message':'An administrator has no assigned area. Staff dashboards and maps will look empty for them.'})
+    if failed:attention.append({'severity':'high','message':f'{job_states.get("failed",0)} background job(s) failed and will not retry.'})
+    if not attention:attention.append({'severity':'ok','message':'No access or delivery problems detected.'})
+
+    return {'users':{'total':len(people),'active':sum(1 for p in people if p.active),
+            'inactive':sum(1 for p in people if not p.active),'by_role':dict(roles),
+            'case_staff':len(case_staff),'admins':len(live_admins)},
+        'areas':{'total':len(areas),'with_staff':len(areas)-len(unstaffed),'without_staff':unstaffed},
+        'reports':{'total':sum(reports.values()),'by_state':reports,'by_category':categories},
+        'advisories':{'total':sum(advisories.values()),'by_state':advisories},
+        'jobs':{'total':sum(job_states.values()),'by_state':job_states,'failed':failed},
+        'image_assistance':ai.status(),
+        'attention':attention,'generated_at':now(),
+        'note':'Account and delivery counts describe system state. They are not measures of field impact.'}
+
 @router.get('/admin/users')
 def users(user:User=Depends(current_user),db:Session=Depends(get_db)):
     require_role(user,'admin')
@@ -116,6 +176,18 @@ def create_user(payload:UserCreate,user:User=Depends(current_user),db:Session=De
 def check_areas(db,ids):
     valid={a.id for a in db.query(Area).all()}
     if not set(ids).issubset(valid):raise HTTPException(422,'Unknown assigned area.')
+
+@router.post('/admin/areas',status_code=201)
+def create_area(payload:AreaCreate,user:User=Depends(current_user),db:Session=Depends(get_db)):
+    """Create a public community centroid. The stored point is the area centre only."""
+    require_role(user,'admin')
+    if db.get(Area,payload.id):raise HTTPException(409,'An area with this key already exists.')
+    a=Area(id=payload.id,name=payload.name,description=payload.description,latitude=payload.latitude,
+        longitude=payload.longitude,radius_km=payload.radius_km)
+    db.add(a);db.flush();audit(db,user,'area.created',a.id);db.commit()
+    touch('areas.updated',a.id)
+    return {'id':a.id,'name':a.name,'description':a.description,'latitude':a.latitude,
+        'longitude':a.longitude,'radius_km':a.radius_km}
 
 @router.patch('/admin/users/{user_id}')
 def access(user_id:str,payload:UserAccess,user:User=Depends(current_user),db:Session=Depends(get_db)):

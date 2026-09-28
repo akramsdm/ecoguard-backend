@@ -90,6 +90,44 @@ docker compose run --rm -e DEMO_ENABLED=true api \
 That prints the `reporter@`, `reviewer@`, `publisher@` and `admin@`
 `ecoguard.example.org` accounts that share the password you supplied.
 
+## Administrators
+
+An administrator signs in at `#/staff/login`. Accounts holding the `admin` role
+additionally get an **Admin** page in the workspace navigation, which reports account
+provisioning, area coverage and delivery health, and warns about the configurations that
+make the rest of the product look broken (an area with no assigned staff, staff with no
+area, a background job that has stopped retrying). Creating staff and assigning areas is
+done in **Team & settings**, which the Admin page links into.
+
+Technical administrator does not imply evidence review or publishing; those are granted
+separately. The admin overview is served by `GET /api/v1/admin/dashboard` and is never
+cached, so it reflects the state as of the read.
+
+To create an administrator:
+
+```bash
+python -m app.cli ensure-admin --email you@example.org --name 'Your Name' \
+  --password '<12+ character password>'
+```
+
+`ensure-admin` is idempotent, so it is the command to use when an administrator has lost
+their password: re-running it resets the password and revokes that account's sessions
+instead of failing the way `create-admin` does. `--roles` and `--areas` are optional and
+**only change what you pass** — omitted means "leave the existing assignment alone", so a
+bare re-run cannot silently strip access. Pass `--areas=` to clear an assignment. Area keys
+must already exist, otherwise it refuses rather than creating a dangling reference.
+
+```bash
+# grant review rights over two known areas
+python -m app.cli ensure-admin --email you@example.org --password '<12+ chars>' \
+  --roles admin,reviewer --areas community-a,wetland-a
+```
+
+A brand new administrator has no assigned areas, which makes the area-scoped staff map
+and dashboard render nothing. Assign at least one, or ask another administrator to do it
+through **Team & settings**: `PATCH /admin/users/{id}` refuses self-modification by
+design, so a lone administrator cannot grant themselves access.
+
 The frontend runs on the host against this API, proxying `/api` to it:
 
 ```bash
