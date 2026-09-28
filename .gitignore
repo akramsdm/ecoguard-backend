@@ -11,3 +11,8 @@ var/
 .DS_Store
 .vercel
 .env*
+# Local database dumps (never commit a private snapshot of dev data)
+backups/
+# Scratch schema-comparison probes from the PostGIS migration work
+_compare_*
+_dump_meta*

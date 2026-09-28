@@ -18,6 +18,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 RUN useradd --create-home --uid 1000 app
 COPY --chown=app:app app ./app
 COPY --chown=app:app scripts ./scripts
+# Alembic migrations and config ship with the image: readiness compares the live
+# revision against head, and containers may run `alembic upgrade head` themselves.
+COPY --chown=app:app alembic.ini ./
+COPY --chown=app:app alembic ./alembic
 RUN mkdir -p /app/var/media /app/var/models /app/var/matplotlib && chown -R app:app /app/var
 
 # kagglehub writes the Kaggle model download into this tree, so the named models volume

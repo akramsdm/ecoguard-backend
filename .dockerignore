@@ -5,3 +5,6 @@ __pycache__
 **/__pycache__
 .DS_Store
 .env
+backups
+_compare_*
+_dump_meta*

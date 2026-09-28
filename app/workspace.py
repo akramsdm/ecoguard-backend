@@ -1,5 +1,8 @@
 from collections import Counter
+from pathlib import Path
 from fastapi import APIRouter,Depends,HTTPException,Query
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import func,text
 from sqlalchemy.orm import Session
 from .db import get_db
@@ -14,21 +17,48 @@ from .cache import cache,touch
 
 router=APIRouter(tags=['Workspace, maps, administration'])
 
+def _alembic_config():
+    cfg=Config(str(Path(__file__).resolve().parents[1] / 'alembic.ini'))
+    cfg.set_main_option('script_location', str(Path(__file__).resolve().parents[1] / 'alembic'))
+    return cfg
+
+def _alembic_head():
+    return ScriptDirectory.from_config(_alembic_config()).get_current_head()
+
+def _alembic_current(db):
+    try:
+        row=db.execute(text('SELECT version_num FROM alembic_version')).first()
+    except Exception:
+        return None
+    return row[0] if row else None
+
+def _postgis_version(db):
+    try:
+        row=db.execute(text("SELECT extversion FROM pg_extension WHERE extname='postgis'")).first()
+    except Exception as exc:
+        raise HTTPException(503, 'Unable to inspect PostGIS capability.') from exc
+    return row[0] if row else None
+
+def database_capabilities(db):
+    if db.bind.dialect.name!='postgresql':
+        return {'status':'ok','database':'sqlite-local-development','alembic':{'current':None,'head':None}}
+    current=_alembic_current(db)
+    head=_alembic_head()
+    postgis=_postgis_version(db)
+    database='postgresql-postgis' if postgis else 'postgresql'
+    payload={'status':'ok','database':database,'postgis_version':postgis,'alembic':{'current':current,'head':head}}
+    if current!=head:
+        raise HTTPException(503, {'status':'error','database':database,'postgis_version':postgis,
+            'alembic':{'current':current,'head':head},'detail':'Database schema is not at the expected Alembic head.'})
+    return payload
+
 @router.get('/health/live')
 def live():return {'status':'ok','service':'EcoGuard API'}
 
 @router.get('/health/ready')
 def ready(db:Session=Depends(get_db)):
     db.execute(text('SELECT 1'))
-    if db.bind.dialect.name!='postgresql':
-        return {'status':'ok','database':'sqlite-local-development'}
-    # The dialect alone does not prove PostGIS: a Postgres database with only plpgsql
-    # installed reports 'postgresql-postgis' under the old check. Ask the catalogue.
-    try:
-        installed=db.execute(text("SELECT 1 FROM pg_extension WHERE extname='postgis'")).first() is not None
-    except Exception:
-        installed=False
-    return {'status':'ok','database':'postgresql-postgis' if installed else 'postgresql'}
+    return database_capabilities(db)
 
 @router.get('/config')
 def config():

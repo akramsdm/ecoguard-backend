@@ -18,3 +18,4 @@ os.environ['STORAGE_BACKEND'] = 'local'
 os.environ['MEDIA_DIR'] = os.path.join(tempfile.gettempdir(), 'ecoguard_pytest_media')
 os.environ['SPECIESNET_WARMUP'] = 'false'
 os.environ['CACHE_TTL_SECONDS'] = '0'
+os.environ['REDIS_URL'] = ''

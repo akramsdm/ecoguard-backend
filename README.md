@@ -35,13 +35,15 @@ Swagger docs: `http://localhost:8000/api/docs`.
 
 ## Local development with Docker
 
-`docker-compose.yml` runs the whole backend — Postgres, Redis and the API — so
-no local Python or database install is needed. Postgres is reachable on
-`localhost:5432` as `postgres` / `postgres` (database `ecoguard`), which is what
-`.env` already expects, so the native venv workflow above keeps working too.
+`docker-compose.yml` runs the whole backend — Postgres (with the **PostGIS**
+extension), Redis and the API — so no local Python or database install is
+needed. Postgres is reachable on `localhost:5432` as `postgres` / `postgres`
+(database `ecoguard`), which is what `.env` already expects, so the native venv
+workflow above keeps working too.
 
 ```bash
 docker compose up -d --build        # db + redis + api on :8000
+python -m alembic upgrade head      # fresh DB: build the schema from migrations
 docker compose ps                   # all three report healthy
 docker compose logs -f api
 docker compose down                 # stop, keep data
@@ -79,8 +81,23 @@ Set `IMAGE_ASSISTANCE=disabled` to turn it off; `/api/v1/config` then reports
 Weights live in the `model-data` volume mounted at `/app/var/models`, which is
 also `KAGGLEHUB_CACHE`. Nothing is downloaded per request.
 
-Tables are created on first start (`AUTO_CREATE_TABLES=true`). The communities
-that reports must reference are seeded once with:
+Database schema changes are managed with Alembic. Fresh databases should be
+initialized with:
+
+```bash
+python -m alembic upgrade head
+```
+
+For an existing development database that already has the current schema, first
+stamp the baseline revision and then upgrade:
+
+```bash
+python -m alembic stamp 0001_baseline_schema
+python -m alembic upgrade head
+```
+
+Use `python -m alembic revision --autogenerate -m 'message'` for future schema
+changes. The communities that reports must reference are seeded once with:
 
 ```bash
 docker compose run --rm -e DEMO_ENABLED=true api \
@@ -141,7 +158,7 @@ API_PROXY_TARGET=http://localhost:8000 npm run dev   # http://localhost:5173
 .venv/Scripts/python.exe -m pytest -q -p no:randomly
 ```
 
-45 tests, no model weights, no network and no PyTorch required — the classifier
+115 tests, no model weights, no network and no PyTorch required — the classifier
 is stubbed. Real-model behaviour is covered separately by
 `python scripts/speciesnet_smoke.py <image>`, which needs the ML extra.
 
@@ -154,7 +171,7 @@ Required environment variables (Vercel project):
 - `REDIS_URL` — Upstash Redis (`rediss://...`), used for cache + realtime event log
 - `ALLOWED_ORIGINS` — frontend origin e.g. `https://ecoguard.vercel.app`
 - `COOKIE_SECURE` = `true`, `SESSION_SAMESITE` = `none` (cross-site session cookie)
-- `APP_ENV` = `development`, `AUTO_CREATE_TABLES` = `true` (idempotent create_all on cold start)
+- `APP_ENV` = `development` (use Alembic to manage schema on cold start)
 - `JOBS_MODE` = `inline` (no Celery worker on serverless)
 - `CSRF_REALM` note: keep `COOKIE_SECURE=true` so `SameSite=None` cookies require HTTPS.
 
@@ -176,7 +193,7 @@ uploads.
 
 - `/health` returns `{"status":"ok","service":...,"version":...}`.
   `/api/v1/health/live` and `/api/v1/health/ready` also exist; `ready` checks the
-  database.
+  database, Alembic revision state and PostGIS availability.
 - `GET /api/v1/config` reports the live `image_assistance` state
   (`not_configured` / `degraded` / `ready`) and `ai_model_version`. Only the
   deployment's static fields are cached, so a model that finishes loading is
@@ -184,8 +201,8 @@ uploads.
 - `degraded` is intentionally broad: it covers *still loading*, *weights or
   runtime absent* and *load failed*. `GET /api/v1/admin/image-assistance`
   (admin only) returns the specific reason.
-- `AUTO_CREATE_TABLES` + `APP_ENV=development` run idempotent `create_all` at
-  startup; production migration flow is via Alembic if you switch `APP_ENV=production`.
+- Development startup no longer creates tables automatically; run Alembic
+  migrations first, then seed data if needed.
 - Application logging is configured by `app/logging_config.py`, which attaches a
   handler to the `app` logger tree only. The root logger is left alone
   deliberately, so third-party libraries do not flood the log. The worker calls

@@ -5,15 +5,22 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm.exc import StaleDataError
 from .config import get_settings
-from .db import Base,engine
+from .db import Base,engine,SessionLocal
 from .logging_config import configure as configure_logging
 from . import models,auth,reports,evidence,advisories,workspace,realtime,ai
 
-configure_logging()
+logger=configure_logging()
 cfg=get_settings()
 @asynccontextmanager
 async def lifespan(app):
-    if cfg.auto_create_tables and cfg.app_env!='production':Base.metadata.create_all(engine)
+    if cfg.app_env=='test' and cfg.auto_create_tables:
+        Base.metadata.create_all(engine)
+    try:
+        with SessionLocal() as db:
+            app.state.readiness=workspace.database_capabilities(db)
+    except Exception as exc:
+        logger.error('Readiness check failed at startup: %s', exc)
+        app.state.readiness_error=str(exc)
     if cfg.ai_enabled:
         import threading
         threading.Thread(target=ai.warmup,name='speciesnet-warmup',daemon=True).start()

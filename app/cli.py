@@ -4,6 +4,7 @@ from .db import Base,engine,SessionLocal
 from .models import User,Area,Report,Review,CaseEvent,Advisory,LoginSession,now
 from .security import hash_password
 from .config import get_settings
+from .workspace import database_capabilities
 
 ROLES={'reporter','reviewer','publisher','responder','admin'}
 
@@ -71,6 +72,12 @@ def seed_demo(password):
         raise SystemExit('DEMO_ENABLED=true in a non-production environment is required.')
     if len(password)<12:raise SystemExit('Use a demo password of at least 12 characters.')
     with SessionLocal() as db:
+        try:
+            caps=database_capabilities(db)
+        except Exception as exc:
+            raise SystemExit('Run Alembic migrations before seeding demo data.') from exc
+        if caps['status']!='ok' or caps['alembic']['current']!=caps['alembic']['head']:
+            raise SystemExit('Run Alembic migrations before seeding demo data.')
         area_data=[('community-a','Community A','Fictional pilot community near western Uganda.',.2,30.1),
             ('community-b','Community B','Fictional river-side pilot area.',.4,30.3),
             ('wetland-a','Wetland zone A','Fictional wetland demonstration area.',.3,32.5)]
@@ -120,8 +127,7 @@ def main():
     parser.add_argument('--areas',action='append',default=None,help='Area key to assign. Repeatable or comma-separated. Omit to leave unchanged; pass --areas "" to clear.')
     args=parser.parse_args()
     if args.command=='init-local':
-        if get_settings().app_env=='production':raise SystemExit('Use Alembic migrations in production.')
-        Base.metadata.create_all(engine)
+        raise SystemExit('Schema management now uses Alembic. Run `alembic upgrade head` instead of create_all.')
     elif args.command=='seed-demo':seed_demo(args.password)
     elif args.command=='ensure-admin':ensure_admin(args.email,args.name,args.password,args.roles,args.areas)
     else:
