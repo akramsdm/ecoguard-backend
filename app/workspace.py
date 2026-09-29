@@ -140,16 +140,22 @@ def map_data(view: str = Query('community', pattern='^(community|staff)$'),
         # for shared locations, private positions -- but only within assigned areas.
         require_role(user, 'reviewer', 'responder', 'publisher', 'admin')
         key = f'map:staff:{user.id}:{category or "all"}:z{z}:{rbox}'
-        body = cache.cached(key, cfg.cache_ttl_seconds,
-                            lambda: _staff_map(db, user, category, minx, miny, maxx, maxy, z))
+        hit = cache.get(key)
+        body = hit if hit is not None else cache.cached(key, cfg.cache_ttl_seconds,
+                                                        lambda: _staff_map(db, user, category, minx, miny, maxx, maxy, z))
     else:
         # Public output is built only from active, published advisories, not
         # hidden reports. Cache is view-scoped and shared, like the old key.
         key = f'map:community:{category or "all"}:z{z}:{rbox}'
-        body = cache.cached(key, cfg.cache_ttl_seconds,
-                            lambda: _community_map(db, category, minx, miny, maxx, maxy, z))
+        hit = cache.get(key)
+        body = hit if hit is not None else cache.cached(key, cfg.cache_ttl_seconds,
+                                                        lambda: _community_map(db, category, minx, miny, maxx, maxy, z))
     debug = dict(body.get('debug') or {})
     debug['cache_key'] = key
+    # Honest source label: 'cache' only when the payload was read back from the
+    # cache -- a fresh computation stamps 'db' (a stale-read here would lie,
+    # because cache.cached() sets the key before returning).
+    debug['source'] = 'cache' if hit is not None else debug.get('source', 'db')
     return {**body, 'debug': debug}
 
 

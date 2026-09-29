@@ -123,6 +123,27 @@ def test_clusters_leave_singletons_as_features(env):
         assert any(f['id'] == far['id'] for f in body['features'])
 
 
+def test_debug_source_is_honest(env, monkeypatch):
+    """debug.source must say 'db' for a fresh computation and 'cache' only for a
+    real cache read-back -- the label is read before the loader is consulted.
+    The cache layer is simulated with a dict so the test is deterministic
+    whether or not Redis is reachable from the test process."""
+    from app.cache import cache
+    _reviewer(env)
+    store: dict = {}
+    monkeypatch.setattr(cache, 'get', lambda key, _s=store: _s.get(key, None))
+    monkeypatch.setattr(cache, 'set', lambda key, value, ttl, _s=store: _s.__setitem__(key, value))
+    with _client(env) as client:
+        login(client, 'reviewer@example.org')
+        # Fixed distinctive viewport: no pre-existing entry can collide.
+        url = '/api/v1/map?view=staff&bbox=33.100,0.100,33.101,0.101&zoom=14'
+        fresh = client.get(url).json()
+        assert fresh['debug']['source'] == 'db'
+        assert fresh['debug']['cache_key'].startswith('map:staff:')
+        hit = client.get(url).json()
+        assert hit['debug']['source'] == 'cache'
+
+
 def test_map_cache_key_includes_dimensions(env, monkeypatch):
     from app.cache import cache
     _reviewer(env)
