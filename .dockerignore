@@ -1,10 +1,29 @@
+# Build context trimming. The image only copies app/, scripts/, alembic/ and
+# alembic.ini, so everything below is dead weight that still gets uploaded to the
+# builder on every deploy.
 .venv
+.venv-ml
 var
-*.db
+node_modules
+.git
+.github
+.agents
+.claude
+.pytest_cache
 __pycache__
 **/__pycache__
+tests
+docs
+api
+backups
+smoke_test.py
+conftest.py
+*.db
+*.sqlite3
 .DS_Store
 .env
-backups
+requirements-dev.txt
+package-lock.json
+skills-lock.json
 _compare_*
 _dump_meta*

@@ -324,7 +324,19 @@ module-level code sets `APP_ENV=development`, which silently enables the live
 auth rate limiter and makes full-suite runs fail with spurious 429s near the
 end.
 
-## Deployment (Vercel)
+## Deployment (Railway — current)
+
+The API is deployed to **Railway**; the web app goes to **Vercel**. See
+**[`docs/DEPLOY.md`](docs/DEPLOY.md)** for the full walkthrough: builder setup,
+the on-start `alembic upgrade head` step and why it lives there, the PostGIS
+requirement, media durability, the Celery-vs-inline decision, health endpoints and
+the complete Railway environment-variable table.
+
+### Legacy: hosting the API on Vercel serverless
+
+Superseded by the Railway setup above and kept only for reference. A Vercel
+serverless function has no long-lived container, so migrations cannot run on
+startup and evidence uploads are ephemeral per instance.
 
 Project `ecoguard-api` → FastAPI entrypoint `app/main.py` is auto-detected.
 Required environment variables (Vercel project):

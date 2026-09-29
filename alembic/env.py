@@ -12,14 +12,19 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.db import Base  # noqa: E402
+from app.db import Base, normalized_database_url  # noqa: E402
 from app.config import get_settings  # noqa: E402
 
 config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-config.set_main_option('sqlalchemy.url', config.get_main_option('sqlalchemy.url') or get_settings().database_url)
+# The provider DSN (Railway, Neon, ...) is a bare "postgresql://" URL; the app pins
+# psycopg v3, so migrations must use the same normalized DSN the app connects with
+# or they would try to load psycopg2. "%" is escaped because configparser treats it
+# as interpolation and managed database passwords routinely contain one.
+config.set_main_option('sqlalchemy.url', config.get_main_option('sqlalchemy.url')
+                        or normalized_database_url(get_settings().database_url).replace('%', '%%'))
 target_metadata = Base.metadata
 
 

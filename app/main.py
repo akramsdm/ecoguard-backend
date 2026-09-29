@@ -27,6 +27,13 @@ async def lifespan(app):
     else:
         ai.log.info('[AI] image assistance disabled by configuration '
                     '(IMAGE_ASSISTANCE=disabled); no model will be loaded.')
+    if cfg.app_env=='production' and cfg.storage_backend=='local':
+        # Evidence is only ever served through authenticated routes, so it is never
+        # public — but on a container platform the container filesystem is per-deploy.
+        logger.warning(
+            'STORAGE_BACKEND=local in production: evidence uploads live in %s inside the container '
+            'and are lost on every deploy. Mount a volume at MEDIA_DIR or set STORAGE_BACKEND=s3.',
+            cfg.media_dir)
     yield
 
 app=FastAPI(title='EcoGuard Uganda API',version='1.0.0',

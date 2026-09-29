@@ -12,12 +12,21 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 COPY requirements.txt requirements-ml.txt ./
+# INSTALL_ML=false builds the much smaller image (~2 GB less) for a deployment that
+# runs with IMAGE_ASSISTANCE=disabled. The classifier is imported lazily and the
+# app reports "degraded" when its runtime is absent, so the smaller image is an
+# explicit trade rather than a startup crash.
+ARG INSTALL_ML=true
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -r requirements.txt -r requirements-ml.txt
+    pip install -r requirements.txt \
+ && if [ "$INSTALL_ML" = "true" ]; then pip install -r requirements-ml.txt; fi
 
 RUN useradd --create-home --uid 1000 app
 COPY --chown=app:app app ./app
 COPY --chown=app:app scripts ./scripts
+# The entrypoint is invoked as `sh scripts/start.sh`, so the executable bit is not
+# strictly required; it is set anyway so a host that execs the file also works.
+RUN chmod +x scripts/start.sh
 # Alembic migrations and config ship with the image: readiness compares the live
 # revision against head, and containers may run `alembic upgrade head` themselves.
 COPY --chown=app:app alembic.ini ./
@@ -30,9 +39,13 @@ ENV KAGGLEHUB_CACHE=/app/var/models \
     MPLCONFIGDIR=/app/var/matplotlib
 
 USER app
+# Documentation only: the platform injects PORT and routes to it. The entrypoint
+# listens on ${PORT:-8000}.
 EXPOSE 8000
 
+# Reads the port from the environment like the app does, so the check stays correct
+# when the platform assigns something other than 8000.
 HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=5 \
-    CMD python -c "import urllib.request as u,sys;sys.exit(0 if u.urlopen('http://127.0.0.1:8000/health',timeout=4).status==200 else 1)"
+    CMD python -c "import os,urllib.request as u,sys;p=os.environ.get('PORT','8000');sys.exit(0 if u.urlopen(f'http://127.0.0.1:{p}/health',timeout=4).status==200 else 1)"
 
-CMD ["uvicorn","app.main:app","--host","0.0.0.0","--port","8000"]
+CMD ["sh","scripts/start.sh"]
