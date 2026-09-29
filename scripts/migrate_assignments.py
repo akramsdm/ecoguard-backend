@@ -82,7 +82,7 @@ def main() -> int:
                 "SELECT id FROM users WHERE email = :e AND active"), {'e': args.assigned_by}).first()
         else:
             grantor = db.execute(text(
-                "SELECT id FROM users WHERE 'admin' = ANY(roles) AND active "
+                "SELECT id FROM users WHERE roles::jsonb ? 'admin' AND active "
                 "ORDER BY created_at LIMIT 1")).first()
         if not grantor:
             print('ERROR: no active administrator found to record as the grantor.')
