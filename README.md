@@ -164,6 +164,37 @@ python scripts/legacy_area_mapping.py --output var/legacy_area_mapping.csv
 That prints the `reporter@`, `reviewer@`, `publisher@` and `admin@`
 `ecoguard.example.org` accounts that share the password you supplied.
 
+### Public near-me surface (step 6)
+
+Anonymous endpoints under `/api/v1/public/*` power the no-sign-in "near me" map
+(step-6 report: `docs/PUBLIC_NEARBY_STEP6.md`):
+
+| Endpoint | Behaviour | Rate limit |
+| --- | --- | --- |
+| `GET /public/nearby` | Reports behind an **active published** advisory within `radius_km` (default 10, cap 50) of `lat`/`lon`, nearest-first, ≤ 200 rows. `ST_DWithin` on the generalised `public_geom` (grid point), exact edge re-checked on geography. Returns only `CASE_FIELDS` (`category, state, distance_km, area_name, observed_at, published_at, location_precision`) + the grid point. Feature id = **advisory** id, never a report id. | 60/min/IP |
+| `GET /public/places` | Combined gazetteer search over `areas_osm` + `places` (local OSM extract, no external geocoder), one representative point per hit. Wildcard characters stripped. Requires PostGIS. | 120/min/IP |
+| `POST/GET/DELETE /public/preferred-location` | Opt-in "remember this location" keyed by an anonymous client id. The API persists only `spatial.grid_point` — the ~1 km coarsened point — never the precise fix. | 30/min/IP |
+
+Both `/public/nearby` and `/public/places` are bound by the existing
+`RateLimiter` (`app/security.py`) and keyed server-side cache (15 s TTL,
+grid-aligned), so a 20 s public poll is cheap. The visibility gate is the same
+as `list_advisories` (`advisories.py`: `state == 'published' AND
+expires_at > now()`); verified-but-unpublished reports stay invisible. The
+exact `lat`/`lon` submitted to `/public/nearby` is used only for the distance
+calculation and is never written — but the uvicorn **access log** still echoes
+raw query strings, which is a documented gap (see the step-6 report §7).
+
+Place-name search depends on the gazetteer import (a node-only second pass over
+the same extract; idempotent):
+
+```bash
+# fills `places` (city/town/village/suburb/quarter/neighbourhood/hamlet nodes)
+python -m app.import_osm_areas --extract var/osm/uganda-latest.osm.pbf --with-places
+```
+
+Migration `0005_public_nearby` adds the `places` trigram indexes and the
+`public_preferred_locations` table.
+
 ### Spatial authorization (area assignments + per-report containment)
 
 Migration `0004_spatial_authorization` adds the PostGIS-backed access model.

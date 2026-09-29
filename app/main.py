@@ -7,7 +7,7 @@ from sqlalchemy.orm.exc import StaleDataError
 from .config import get_settings
 from .db import Base,engine,SessionLocal
 from .logging_config import configure as configure_logging
-from . import models,auth,reports,evidence,advisories,workspace,realtime,ai,osm_areas
+from . import models,auth,reports,evidence,advisories,workspace,realtime,ai,osm_areas,public
 
 logger=configure_logging()
 cfg=get_settings()
@@ -58,7 +58,7 @@ async def safeguards(request:Request,call_next):
 async def conflict(request,exc):
     return JSONResponse(status_code=409,content={'detail':'Another user changed this record. Reload and try again.'})
 
-for router in [auth.router,reports.router,evidence.router,advisories.router,workspace.router,realtime.router,osm_areas.router]:
+for router in [auth.router,reports.router,evidence.router,advisories.router,workspace.router,realtime.router,osm_areas.router,public.router]:
     app.include_router(router,prefix='/api/v1')
 
 @app.get('/health')

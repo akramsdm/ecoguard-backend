@@ -145,16 +145,99 @@ _DELETE_ALIASES_SQL = text('DELETE FROM areas_osm_aliases WHERE area_osm_id = :a
 _INSERT_ALIASES_SQL = text(
     'INSERT INTO areas_osm_aliases (area_osm_id, alias, source) VALUES (:aid, :alias, :source)')
 
+# Gazetteer nodes (step 6): places.name search backs the public place-name
+# lookup, so the same local OSM extract is reused instead of any live geocoding
+# service. The kind vocabulary is the usual populated-place ladder; hamlet is
+# the smallest accepted so the table stays a useful gazetteer without drowning
+# in micro labels.
+_PLACE_KIND_VOCABULARY = (
+    'city', 'town', 'village', 'suburb', 'quarter', 'neighbourhood', 'hamlet',
+)
+# Pad the country bounds slightly so border settlements that resolve a search
+# just across the line are included.
+_PLACE_BBOX = (29.0 - 0.5, -1.6 - 0.5, 35.5 + 0.5, 4.5 + 0.5)
+
+_UPSERT_PLACE_SQL = text(
+    """
+    INSERT INTO places (osm_type, osm_id, name, alt_names, kind, geom)
+    VALUES ('node', :osm_id, :name, :alt_names, :kind,
+            ST_SetSRID(ST_MakePoint(:lon, :lat), 4326))
+    ON CONFLICT (osm_type, osm_id) DO UPDATE SET
+        name = EXCLUDED.name,
+        alt_names = EXCLUDED.alt_names,
+        kind = EXCLUDED.kind,
+        geom = EXCLUDED.geom
+    """)
+
+
+def import_places(conn, extract_path, *, kinds=None, bbox=None,
+                  name_alias_keys=None, dry_run=False) -> dict:
+    """Populate the ``places`` gazetteer from place=* nodes in the extract.
+
+    A second, node-only pass over the same PBF (no location index needed: node
+    coordinates are stored inline). Idempotent via the (osm_type, osm_id)
+    unique constraint. No live external geocoding service is ever consulted.
+    ``conn`` is an active transaction from the caller (``engine.begin()``).
+    """
+    _osmium = _lazy_osmium()
+    kinds = kinds or _PLACE_KIND_VOCABULARY
+    minx, miny, maxx, maxy = bbox if bbox is not None else _PLACE_BBOX
+    name_keys = name_alias_keys or []
+    stats = {
+        'gazetteer_kinds': list(kinds),
+        'total_places': 0,
+        'matched_places': 0,
+        'places_inserted_or_updated': 0,
+        'places_skipped_unclassified': 0,
+        'places_table_rows': None,
+    }
+
+    class _PlaceHandler(_osmium.SimpleHandler):
+        def node(self, node):  # noqa: ANN001 - libosmium Node
+            if node.location is None:
+                return
+            lon, lat = node.location.lon, node.location.lat
+            if not (minx <= lon <= maxx and miny <= lat <= maxy):
+                return
+            tags = {k: v for k, v in node.tags}
+            kind = tags.get('place')
+            name = tags.get('name')
+            if not kind or kind not in kinds or not name:
+                stats['places_skipped_unclassified'] += 1
+                return
+            stats['matched_places'] += 1
+            if dry_run:
+                return
+            alt_vals = _alias_values(tags, name_keys)
+            conn.execute(_UPSERT_PLACE_SQL, {
+                'osm_id': node.id,
+                'name': name,
+                'alt_names': alt_vals,
+                'kind': kind,
+                'lon': float(lon),
+                'lat': float(lat),
+            })
+            stats['places_inserted_or_updated'] += 1
+
+    handler = _PlaceHandler()
+    handler.apply_file(str(extract_path))
+    stats['total_places'] = stats['matched_places'] + stats['places_skipped_unclassified']
+    return stats
+
 
 # --------------------------------------------------------------------------- #
 # Import runner
 # --------------------------------------------------------------------------- #
 def run_import(engine, extract_path, config=None, *, tolerance=None, min_area_sqm=None,
-               limit=None, area_type=None, dry_run=False, location_index='sparse_file_array'):
+               limit=None, area_type=None, dry_run=False, location_index='sparse_file_array',
+               with_places=False):
     """Import ``extract_path`` into the engine's ``areas_osm`` tables.
 
     Returns a statistics dict. Idempotent: rerunning against the same extract
     upserts the same (osm_type, osm_id) rows instead of duplicating them.
+
+    With ``with_places=True`` a second node-only pass also fills the ``places``
+    gazetteer from the same extract (see :func:`import_places`).
 
     ``location_index`` selects the libosmium node-location index used to assemble
     areas: ``sparse_file_array`` (default) is disk-backed and works for whole
@@ -180,10 +263,18 @@ def run_import(engine, extract_path, config=None, *, tolerance=None, min_area_sq
         'inserted_or_updated': 0,
         'aliases': 0,
         'dry_run': bool(dry_run),
+        'with_places': bool(with_places),
         'runtime_seconds': None,
         'table_rows': None,
         'table_size_bytes': None,
     }
+    if with_places:
+        stats['gazetteer_kinds'] = list(config.get('place_kinds') or _PLACE_KIND_VOCABULARY)
+        stats['total_places'] = 0
+        stats['matched_places'] = 0
+        stats['places_inserted_or_updated'] = 0
+        stats['places_skipped_unclassified'] = 0
+        stats['places_table_rows'] = None
     tol = tolerance if tolerance is not None else config.get('simplify_tolerance_degrees', 0.01)
     min_area = min_area_sqm if min_area_sqm is not None else config.get('min_area_sqm', 0)
     name_alias_keys = config.get('name_alias_keys', [])
@@ -310,11 +401,27 @@ def run_import(engine, extract_path, config=None, *, tolerance=None, min_area_sq
         except _StopImport:
             pass
 
+        if with_places:
+            place_stats = import_places(
+                conn, extract_path,
+                kinds=config.get('place_kinds') or _PLACE_KIND_VOCABULARY,
+                name_alias_keys=name_alias_keys,
+                dry_run=dry_run,
+            )
+            stats['gazetteer_kinds'] = place_stats['gazetteer_kinds']
+            stats['total_places'] = place_stats['total_places']
+            stats['matched_places'] = place_stats['matched_places']
+            stats['places_inserted_or_updated'] = place_stats['places_inserted_or_updated']
+            stats['places_skipped_unclassified'] = place_stats['places_skipped_unclassified']
+
     if not dry_run:
         with engine.connect() as conn:
             stats['table_rows'] = conn.execute(text('SELECT count(*) FROM areas_osm')).scalar()
             stats['table_size_bytes'] = conn.execute(
                 text("SELECT pg_total_relation_size('areas_osm')")).scalar()
+            if with_places:
+                stats['places_table_rows'] = conn.execute(
+                    text('SELECT count(*) FROM places')).scalar()
     stats['runtime_seconds'] = round(time.time() - started, 3)
     return stats
 
@@ -390,6 +497,9 @@ def main(argv=None) -> int:
     parser.add_argument('--min-area-sqm', type=float, default=None, help='Skip features smaller than this area (default: from config).')
     parser.add_argument('--limit', type=int, default=None, help='Stop after N imported features (dry-run/testing).')
     parser.add_argument('--area-type', default=None, help='Restrict import to one area_type (testing).')
+    parser.add_argument('--with-places', action='store_true',
+                        help='Also populate the places gazetteer (city/town/village/suburb nodes) '
+                             'from the same extract.')
     parser.add_argument('--dry-run', action='store_true', help='Classify + validate only; do not touch the database.')
     parser.add_argument('--location-index', default='sparse_file_array',
                         help='libosmium node-location index: sparse_file_array (default, disk-backed) '
@@ -418,7 +528,7 @@ def main(argv=None) -> int:
         engine, args.extract, config,
         tolerance=args.tolerance, min_area_sqm=args.min_area_sqm,
         limit=args.limit, area_type=args.area_type, dry_run=args.dry_run,
-        location_index=args.location_index,
+        location_index=args.location_index, with_places=args.with_places,
     )
     _print_summary(stats)
     if args.tmp_dir:
@@ -452,6 +562,12 @@ def _print_summary(stats) -> None:
         print(f"  aliases written   : {stats['aliases']}")
         print(f"  table rows        : {stats['table_rows']}")
         print(f"  table size        : {stats['table_size_bytes']} bytes")
+        if stats.get('with_places'):
+            print('  place gazetteer   : '
+                  f"{stats.get('matched_places', 0)} matched "
+                  f"({', '.join(stats.get('gazetteer_kinds') or [])}), "
+                  f"{stats.get('places_inserted_or_updated', 0)} inserted/updated, "
+                  f"table rows {stats.get('places_table_rows')}")
     print(f"  runtime           : {stats['runtime_seconds']} s")
 
 

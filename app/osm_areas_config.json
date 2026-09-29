@@ -5,6 +5,7 @@
   "simplify_tolerance_degrees": 0.01,
   "min_area_sqm": 0,
   "osm_types": ["way", "relation"],
+  "place_kinds": ["city", "town", "village", "suburb", "quarter", "neighbourhood", "hamlet"],
   "area_types": [
     {
       "type": "district",
