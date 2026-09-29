@@ -7,7 +7,8 @@ from sqlalchemy.exc import IntegrityError
 from .db import get_db
 from .models import User, Area, Report, Evidence, Review, CaseEvent, Message, Advisory, now
 from .schemas import ReportWrite, ReportUpdate, VersionRequest, ReviewWrite, AssignWrite, CloseWrite, MessageWrite
-from .security import current_user, report_access, can_see_report, is_case_staff, require_role, require_area, check_version, audit
+from .security import current_user, report_access, is_case_staff, require_role, check_version, audit
+from . import spatial
 from .cache import touch
 
 router=APIRouter(prefix='/reports',tags=['Reports and cases'])
@@ -15,8 +16,18 @@ router=APIRouter(prefix='/reports',tags=['Reports and cases'])
 def visible_query(db,user):
     q=db.query(Report)
     if is_case_staff(user):
+        if spatial.postgis_active(db):
+            # Staff see every non-draft report; in-area rows render full and
+            # out-of-area rows render redacted via spatial.visibility_map.
+            return q.filter(or_(Report.owner_id==user.id,Report.state!='draft'))
         return q.filter(or_(Report.owner_id==user.id,and_(Report.area_id.in_(user.areas),Report.state!='draft')))
     return q.filter(Report.owner_id==user.id)
+
+def serialize_report(db,r,user,mode,detail=False):
+    if mode=='redacted':
+        area=db.get(Area,r.area_id)
+        return spatial.redacted_view(r,area.name if area else r.area_id)
+    return report_view(db,r,user,detail)
 
 def report_view(db,r,user,detail=False):
     data={k:getattr(r,k) for k in ['id','code','client_id','category','title','description','species','area_id',
@@ -66,7 +77,9 @@ def list_reports(user:User=Depends(current_user),db:Session=Depends(get_db),
     if q:query=query.filter(or_(Report.title.ilike('%'+q+'%'),Report.code.ilike('%'+q+'%')))
     total=query.count()
     rows=query.order_by(Report.created_at.desc()).offset((page-1)*page_size).limit(page_size).all()
-    return {'items':[report_view(db,r,user) for r in rows],'total':total,'page':page,'page_size':page_size}
+    modes=spatial.visibility_map(db,user,rows)
+    return {'items':[serialize_report(db,r,user,modes.get(r.id,'full')) for r in rows],
+        'total':total,'page':page,'page_size':page_size}
 
 @router.get('/export.csv')
 def export(user:User=Depends(current_user),db:Session=Depends(get_db)):
@@ -76,7 +89,11 @@ def export(user:User=Depends(current_user),db:Session=Depends(get_db)):
     def safe(v):
         s=str(v or '')
         return "'"+s if s.lstrip().startswith(('=','+','-','@','\t','\r')) else s
-    for r in visible_query(db,user).limit(10000).all():
+    rows=visible_query(db,user).limit(10000).all()
+    modes=spatial.visibility_map(db,user,rows)
+    for r in rows:
+        if modes.get(r.id,'full')=='redacted':
+            continue  # export is scoped to acted-on areas only
         writer.writerow([safe(x) for x in [r.code,r.category,r.title,r.area_id,r.state,r.created_at,r.updated_at]])
     audit(db,user,'reports.exported'); db.commit()
     return Response(output.getvalue(),media_type='text/csv',headers={'Content-Disposition':'attachment; filename="ecoguard-reports.csv"'})
@@ -90,7 +107,10 @@ def create(payload:ReportWrite,user:User=Depends(current_user),db:Session=Depend
         if existing.request_hash!=digest:raise HTTPException(409,'This draft key has already been used for different content.')
         return report_view(db,existing,user,True)
     attachments=check_evidence(db,user,payload.evidence_ids)
+    loc=spatial.resolve_location(db.get(Area,payload.area_id),payload.latitude,payload.longitude,payload.share_location)
     r=Report(**payload_dict(payload),owner_id=user.id,code='EG-'+payload.category[0].upper()+'-'+uuid4().hex[:8].upper(),request_hash=digest)
+    if spatial.postgis_active(db) and loc:
+        r.latitude=loc['public_lat'];r.longitude=loc['public_lon']
     db.add(r)
     try:db.flush()
     except IntegrityError:
@@ -98,33 +118,44 @@ def create(payload:ReportWrite,user:User=Depends(current_user),db:Session=Depend
         if existing and existing.request_hash==digest:return report_view(db,existing,user,True)
         raise HTTPException(409,'Draft key conflict. Reload and try again.')
     for e in attachments:e.report_id=r.id
+    if spatial.postgis_active(db) and loc:
+        spatial.store_report_location(db,r.id,loc['precise_lon'],loc['precise_lat'],loc['public_lon'],loc['public_lat'],loc['precision'],loc['source'])
+        spatial.rebuild_report_areas(db,r.id)
     event(db,r,user,'draft','Report saved privately.');db.commit()
     touch('reports.updated',r.id)
     return report_view(db,r,user,True)
 
 @router.get('/{report_id}')
 def get_report(report_id:str,user:User=Depends(current_user),db:Session=Depends(get_db)):
-    return report_view(db,report_access(db,user,report_id),user,True)
+    report,mode=report_access(db,user,report_id,redacted=True)
+    return serialize_report(db,report,user,mode,detail=True)
 
 @router.put('/{report_id}')
 def update(report_id:str,payload:ReportUpdate,user:User=Depends(current_user),db:Session=Depends(get_db)):
-    r=report_access(db,user,report_id,True);check_version(r,payload.version)
+    r,_=report_access(db,user,report_id,True);check_version(r,payload.version)
     if r.owner_id!=user.id or r.state not in ('draft','needs_evidence'):
         raise HTTPException(409,'Only the reporter may edit a draft or a report needing evidence.')
-    if not db.get(Area,payload.area_id):raise HTTPException(422,'Unknown community.')
+    area=db.get(Area,payload.area_id)
+    if not area:raise HTTPException(422,'Unknown community.')
     attachments=check_evidence(db,user,payload.evidence_ids,r.id)
     for key,value in payload_dict(payload).items():
         if key!='client_id':setattr(r,key,value)
+    loc=spatial.resolve_location(area,payload.latitude,payload.longitude,payload.share_location)
+    if spatial.postgis_active(db) and loc:
+        r.latitude=loc['public_lat'];r.longitude=loc['public_lon']
     for e in db.query(Evidence).filter_by(report_id=r.id).all():
         if e.id not in payload.evidence_ids:e.report_id=None
     for e in attachments:e.report_id=r.id
+    if spatial.postgis_active(db) and loc:
+        spatial.store_report_location(db,r.id,loc['precise_lon'],loc['precise_lat'],loc['public_lon'],loc['public_lat'],loc['precision'],loc['source'])
+        spatial.rebuild_report_areas(db,r.id)
     event(db,r,user,'edited','Reporter updated the evidence.');db.commit()
     touch('reports.updated',r.id)
     return report_view(db,r,user,True)
 
 @router.post('/{report_id}/submit')
 def submit(report_id:str,payload:VersionRequest,user:User=Depends(current_user),db:Session=Depends(get_db)):
-    r=report_access(db,user,report_id,True)
+    r,_=report_access(db,user,report_id,True)
     if r.owner_id!=user.id:raise HTTPException(403,'Only the reporter can submit this report.')
     # Safe retry after the first successful submission.
     if r.state=='submitted':return report_view(db,r,user,True)
@@ -136,7 +167,7 @@ def submit(report_id:str,payload:VersionRequest,user:User=Depends(current_user),
 
 @router.post('/{report_id}/review')
 def review(report_id:str,payload:ReviewWrite,user:User=Depends(current_user),db:Session=Depends(get_db)):
-    require_role(user,'reviewer');r=report_access(db,user,report_id,True);require_area(user,r.area_id);check_version(r,payload.version)
+    require_role(user,'reviewer');r,_=report_access(db,user,report_id,True);check_version(r,payload.version)
     if r.owner_id==user.id:raise HTTPException(403,'A different reviewer must assess your own report.')
     if r.state not in ('submitted','under_review','needs_evidence'):
         raise HTTPException(409,'Only an open review can be decided.')
@@ -150,9 +181,14 @@ def review(report_id:str,payload:ReviewWrite,user:User=Depends(current_user),db:
 
 @router.post('/{report_id}/assign')
 def assign(report_id:str,payload:AssignWrite,user:User=Depends(current_user),db:Session=Depends(get_db)):
-    require_role(user,'reviewer','responder');r=report_access(db,user,report_id,True);require_area(user,r.area_id);check_version(r,payload.version)
+    require_role(user,'reviewer','responder');r,_=report_access(db,user,report_id,True);check_version(r,payload.version)
     assignee=db.get(User,payload.assignee_id)
-    if not assignee or not assignee.active or r.area_id not in assignee.areas or not set(assignee.roles).intersection({'reviewer','responder'}):
+    if not assignee or not assignee.active or not set(assignee.roles).intersection({'reviewer','responder'}):
+        raise HTTPException(422,'Choose an active reviewer or responder assigned to this area.')
+    if spatial.postgis_active(db):
+        if not spatial.overlaps_report(db,assignee.id,r.id):
+            raise HTTPException(422,'Choose an active reviewer or responder assigned to this area.')
+    elif r.area_id not in (assignee.areas or []):
         raise HTTPException(422,'Choose an active reviewer or responder assigned to this area.')
     r.assignee_id=assignee.id;event(db,r,user,'assigned','Case assigned for follow-up.');db.commit()
     touch('reports.updated',r.id)
@@ -160,7 +196,7 @@ def assign(report_id:str,payload:AssignWrite,user:User=Depends(current_user),db:
 
 @router.post('/{report_id}/close')
 def close(report_id:str,payload:CloseWrite,user:User=Depends(current_user),db:Session=Depends(get_db)):
-    require_role(user,'responder');r=report_access(db,user,report_id,True);require_area(user,r.area_id);check_version(r,payload.version)
+    require_role(user,'responder');r,_=report_access(db,user,report_id,True);check_version(r,payload.version)
     if r.state not in ('verified','rejected'):raise HTTPException(409,'Verify or reject the report before closing it.')
     r.state='closed';event(db,r,user,'closed',payload.note);db.commit()
     touch('reports.updated',r.id)
@@ -168,13 +204,13 @@ def close(report_id:str,payload:CloseWrite,user:User=Depends(current_user),db:Se
 
 @router.get('/{report_id}/messages')
 def messages(report_id:str,user:User=Depends(current_user),db:Session=Depends(get_db)):
-    report_access(db,user,report_id)
+    report_access(db,user,report_id)  # full access: redacted-only staff get 403, never messages
     return {'items':[{'id':m.id,'body':m.body,'is_mine':m.sender_id==user.id,'sender_label':'You' if m.sender_id==user.id else 'Case participant',
         'created_at':m.created_at} for m in db.query(Message).filter_by(report_id=report_id).order_by(Message.created_at).all()]}
 
 @router.post('/{report_id}/messages',status_code=201)
 def send_message(report_id:str,payload:MessageWrite,user:User=Depends(current_user),db:Session=Depends(get_db)):
-    r=report_access(db,user,report_id)
+    r,_=report_access(db,user,report_id)
     if r.state=='draft':raise HTTPException(409,'Submit the report before sending a message.')
     msg=Message(report_id=report_id,sender_id=user.id,body=payload.body);db.add(msg);audit(db,user,'message.created',report_id);db.commit()
     touch('reports.updated',report_id)

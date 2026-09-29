@@ -74,8 +74,8 @@ class ReportWrite(Strict):
             raise ValueError('Consent is required before transmitting a report.')
         if (self.latitude is None) != (self.longitude is None):
             raise ValueError('Supply both latitude and longitude, or neither.')
-        if self.latitude is not None and not self.share_location:
-            raise ValueError('Private location sharing must be explicitly permitted.')
+        if self.share_location and (self.latitude is None or self.longitude is None):
+            raise ValueError('Share a precise location when enabling location sharing.')
         return self
 
 class ReportUpdate(ReportWrite):

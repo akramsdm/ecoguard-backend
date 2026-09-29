@@ -10,9 +10,10 @@ from .config import get_settings
 from .models import User,Area,Report,Advisory,Audit,Outbox,LoginSession,now
 from .schemas import UserCreate,UserAccess,AreaCreate
 from .security import current_user,require_role,hash_password,audit,is_case_staff
-from .reports import visible_query,report_view
+from .reports import visible_query,report_view,serialize_report
 from .auth import user_view
 from . import ai
+from . import spatial
 from .cache import cache,touch
 
 router=APIRouter(tags=['Workspace, maps, administration'])
@@ -89,6 +90,7 @@ def dashboard(user:User=Depends(current_user),db:Session=Depends(get_db)):
 
 def _dashboard_rows(db,user):
     rows=visible_query(db,user).all()
+    modes=spatial.visibility_map(db,user,rows)
     categories=Counter(r.category for r in rows);states=Counter(r.state for r in rows)
     days=Counter(r.created_at[:10] for r in rows)
     return {'counts':{'wildlife':categories['wildlife'],'wetland':categories['wetland'],'flood':categories['flood'],
@@ -96,7 +98,7 @@ def _dashboard_rows(db,user):
         'verified':states['verified'],'closed':states['closed']},
         'states':dict(states),'categories':dict(categories),
         'activity':[{'date':day,'count':count} for day,count in sorted(days.items())[-30:]],
-        'recent':[report_view(db,r,user) for r in sorted(rows,key=lambda r:r.created_at,reverse=True)[:6]],
+        'recent':[serialize_report(db,r,user,modes.get(r.id,'full')) for r in sorted(rows,key=lambda r:r.created_at,reverse=True)[:6]],
         'scope':'assigned areas and own reports' if is_case_staff(user) else 'your reports',
         'ai_metrics':None,'note':'Operational counts are not field-impact or model-accuracy measurements.'}
 
@@ -112,8 +114,19 @@ def map_data(view:str=Query('community',pattern='^(community|staff)$'),category:
         require_role(user,'reviewer','responder','publisher','admin')
         query=visible_query(db,user)
         if category:query=query.filter(Report.category==category)
-        for r in query.limit(1000).all():
+        rows=query.limit(1000).all()
+        modes=spatial.visibility_map(db,user,rows)
+        for r in rows:
             area=db.get(Area,r.area_id)
+            if modes.get(r.id,'full')=='redacted':
+                # Out-of-area staff see only the generalised point — no title,
+                # case code or precise coordinates can leak.
+                lon,lat=(r.longitude if r.longitude is not None else area.longitude,
+                         r.latitude if r.latitude is not None else area.latitude)
+                features.append({'type':'Feature','id':r.id,'geometry':{'type':'Point','coordinates':[lon,lat]},
+                    'properties':{'id':r.id,'category':r.category,'state':r.state,
+                        'area_name':area.name,'precision':'generalised','kind':'report','redacted':True}})
+                continue
             private=r.share_location and r.latitude is not None
             lon,lat=(r.longitude,r.latitude) if private else (area.longitude,area.latitude)
             features.append({'type':'Feature','id':r.id,'geometry':{'type':'Point','coordinates':[lon,lat]},
@@ -201,10 +214,28 @@ def create_user(payload:UserCreate,user:User=Depends(current_user),db:Session=De
     check_areas(db,payload.areas)
     u=User(name=payload.name,email=str(payload.email).lower(),password_hash=hash_password(payload.password),
         roles=list(set(payload.roles)),areas=list(set(payload.areas)),preferences={})
-    db.add(u);db.flush();audit(db,user,'access.user_created',u.id);db.commit()
+    db.add(u);db.flush()
+    if spatial.postgis_active(db):
+        spatial.set_assignments(db,u.id,[int(a) for a in payload.areas],assigned_by=user.id)
+    audit(db,user,'access.user_created',u.id);db.commit()
     return user_view(u)
 
 def check_areas(db,ids):
+    """Validate the ``areas`` payload.
+
+    On PostgreSQL administrators assign ``areas_osm`` ids (they become
+    ``user_area_assignments`` rows) and inactive/unknown ids are rejected; the
+    SQLite harness validates the legacy area keys it still mirrors in User.areas.
+    """
+    if spatial.postgis_active(db):
+        try:
+            requested=[int(i) for i in ids]
+        except (TypeError,ValueError):
+            raise HTTPException(422,'Unknown or inactive assigned area.') from None
+        valid=spatial.valid_assignment_ids(db,requested)
+        if len(valid)!=len(set(requested)):
+            raise HTTPException(422,'Unknown or inactive assigned area.')
+        return
     valid={a.id for a in db.query(Area).all()}
     if not set(ids).issubset(valid):raise HTTPException(422,'Unknown assigned area.')
 
@@ -228,6 +259,11 @@ def access(user_id:str,payload:UserAccess,user:User=Depends(current_user),db:Ses
     if not u:raise HTTPException(404,'User not found.')
     check_areas(db,payload.areas)
     u.roles=list(set(payload.roles));u.areas=list(set(payload.areas));u.active=payload.active
+    if spatial.postgis_active(db):
+        # Live assignments now live in user_area_assignments (areas_osm ids);
+        # User.areas is dual-written as a derived, deprecated mirror until the
+        # legacy display path is retired.
+        spatial.set_assignments(db,u.id,[int(a) for a in payload.areas],assigned_by=user.id)
     db.query(LoginSession).filter_by(user_id=u.id).delete(synchronize_session=False)
     audit(db,user,'access.updated_sessions_revoked',u.id);db.commit()
     return user_view(u)

@@ -6,6 +6,7 @@ from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError, InvalidHashError
 from .db import get_db
 from .config import get_settings
+from . import spatial
 from .models import User, LoginSession, Report, Evidence, Audit
 
 hasher = PasswordHasher()
@@ -49,21 +50,39 @@ def is_case_staff(user):
     return bool(set(user.roles).intersection({'reviewer','publisher','responder','admin'}))
 
 def can_see_report(user, report):
+    # Retained as the legacy exact-membership view used by the SQLite harness via
+    # spatial.report_mode; real authorization now runs through spatial.report_mode.
     return report.owner_id == user.id or (is_case_staff(user) and report.area_id in user.areas and report.state != 'draft')
 
-def report_access(db, user, report_id, lock=False):
+def report_access(db, user, report_id, lock=False, redacted=False):
+    """Authorize a user against a report.
+
+    Returns ``(report, mode)`` where mode is ``'full'`` or ``'redacted'``.
+
+    Raises:
+      404 -- the report does not exist, or the user may not see it at all
+            (plain reporter on someone else's report, or any draft report).
+      403 -- the user may only see a redacted view but the caller needs full
+            access (every mutating route, evidence content, messages).
+    """
     q = db.query(Report).filter(Report.id == report_id)
     if lock: q = q.with_for_update()
     report = q.first()
-    if not report or not can_see_report(user, report):
+    if not report:
         raise HTTPException(404, 'Report not found.')
-    return report
+    mode = spatial.report_mode(db, user, report)
+    if mode is None:
+        raise HTTPException(404, 'Report not found.')
+    if mode == 'redacted' and not redacted:
+        raise HTTPException(403, 'This area is not assigned to you.')
+    return report, mode
 
 def evidence_access(db, user, evidence_id):
     item = db.get(Evidence, evidence_id)
     if not item: raise HTTPException(404, 'Evidence not found.')
     if item.owner_id != user.id:
         if not item.report_id: raise HTTPException(404, 'Evidence not found.')
+        # Full access only: evidence is never part of the redacted view.
         report_access(db, user, item.report_id)
     return item
 

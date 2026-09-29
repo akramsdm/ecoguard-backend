@@ -120,7 +120,7 @@ def test_readiness_fails_closed_when_postgis_is_unreadable(monkeypatch):
     assert exc.value.status_code == 503
 
 
-def test_migration_baseline_matches_live_schema_and_head_installs_postgis():
+def test_migrations_at_head_match_live_schema_and_install_postgis():
     try:
         admin = _admin_engine()
         with admin.connect() as conn:
@@ -136,7 +136,10 @@ def test_migration_baseline_matches_live_schema_and_head_installs_postgis():
             conn.execute(text(f'CREATE DATABASE "{scratch}" TEMPLATE template0'))
 
         cfg = _make_alembic_cfg(_scratch_url(scratch))
-        command.upgrade(cfg, '0001_baseline_schema')
+        # Compare at head: the live dev database moves forward with each schema
+        # step (it is at 0004 for spatial authorization), so the scratch schema
+        # must be migrated to the same head the live DB must be on.
+        command.upgrade(cfg, 'head')
 
         live = create_engine(LIVE_URL)
         assert _schema_signature(scratch_engine) == _schema_signature(live)
