@@ -144,8 +144,9 @@ def map_data(view: str = Query('community', pattern='^(community|staff)$'),
         body = hit if hit is not None else cache.cached(key, cfg.cache_ttl_seconds,
                                                         lambda: _staff_map(db, user, category, minx, miny, maxx, maxy, z))
     else:
-        # Public output is built only from active, published advisories, not
-        # hidden reports. Cache is view-scoped and shared, like the old key.
+        # Signed-in community view: published advisories plus every non-draft
+        # case pinned at its legacy area centroid. Private positions never
+        # leave the server, so the cache stays view-scoped and shared.
         key = f'map:community:{category or "all"}:z{z}:{rbox}'
         hit = cache.get(key)
         body = hit if hit is not None else cache.cached(key, cfg.cache_ttl_seconds,
@@ -236,25 +237,52 @@ def _report_ids_in_bbox(db, category, minx, miny, maxx, maxy):
 
 
 def _community_map(db, category, minx, miny, maxx, maxy, zoom):
-    if spatial.postgis_active(db):
-        ids = _advisory_ids_in_bbox(db, category, minx, miny, maxx, maxy)
-        query = db.query(Advisory).filter(Advisory.id.in_(ids)) if ids else db.query(Advisory).filter(text('1 = 0'))
-        if category:
-            query = query.filter(Advisory.category == category)
-        rows = query.limit(1000).all()
-    else:
-        query = db.query(Advisory).filter(Advisory.state == 'published', Advisory.expires_at > now())
-        if category:
-            query = query.filter(Advisory.category == category)
-        rows = query.limit(1000).all()
+    """Community map data for signed-in users.
+
+    Published, unexpired advisories plus every non-draft report (an open
+    "case"), pinned at the legacy area centroid. Drafts stay private, a report
+    that is already publicised by a published advisory is not duplicated by its
+    own case pin, and the precise position of a shared report is never read.
+    """
     features = []
-    for a in rows:
+    if spatial.postgis_active(db):
+        advisory_ids = _advisory_ids_in_bbox(db, category, minx, miny, maxx, maxy)
+        advisory_query = (db.query(Advisory).filter(Advisory.id.in_(advisory_ids))
+                          if advisory_ids else db.query(Advisory).filter(text('1 = 0')))
+        if category:
+            advisory_query = advisory_query.filter(Advisory.category == category)
+        advisory_rows = advisory_query.limit(1000).all()
+        case_ids = _case_ids_in_bbox(db, category, minx, miny, maxx, maxy)
+        case_query = (db.query(Report).filter(Report.id.in_(case_ids))
+                      if case_ids else db.query(Report).filter(text('1 = 0')))
+        if category:
+            case_query = case_query.filter(Report.category == category)
+        case_rows = case_query.limit(1000).all()
+    else:
+        # SQLite harness: same composition with scalar filters.
+        advisory_rows = db.query(Advisory).filter(
+            Advisory.state == 'published', Advisory.expires_at > now()).limit(1000).all()
+        public_report_ids = {rid for (rid,) in db.query(Advisory.report_id).filter(
+            Advisory.state == 'published', Advisory.expires_at > now()).all() if rid}
+        case_rows = db.query(Report).filter(Report.state != 'draft').limit(1000).all()
+        if category:
+            advisory_rows = [a for a in advisory_rows if a.category == category]
+            case_rows = [r for r in case_rows if r.category == category]
+        case_rows = [r for r in case_rows if r.id not in public_report_ids]
+    for a in advisory_rows:
         area = db.get(Area, a.area_id)
         features.append({'type': 'Feature', 'id': a.id,
                          'geometry': {'type': 'Point', 'coordinates': [area.longitude, area.latitude]},
                          'properties': {'id': a.id, 'title': a.title, 'category': a.category,
                                         'state': 'published', 'area_name': area.name,
                                         'precision': 'community-centroid', 'kind': 'advisory'}})
+    for r in case_rows:
+        area = db.get(Area, r.area_id)
+        features.append({'type': 'Feature', 'id': r.id,
+                         'geometry': {'type': 'Point', 'coordinates': [area.longitude, area.latitude]},
+                         'properties': {'id': r.id, 'title': r.title, 'category': r.category,
+                                        'state': r.state, 'area_name': area.name,
+                                        'precision': 'community-centroid', 'kind': 'report'}})
     features, clusters = _maybe_cluster(features, zoom)
     return _map_body(features, clusters, [], 'db')
 
@@ -275,6 +303,29 @@ def _advisory_ids_in_bbox(db, category, minx, miny, maxx, maxy):
               'minx': minx, 'miny': miny, 'maxx': maxx, 'maxy': maxy}
     if category:
         sql += ' AND a.category = :category'
+        params['category'] = category
+    return [row[0] for row in db.execute(text(sql), params).all()]
+
+
+def _case_ids_in_bbox(db, category, minx, miny, maxx, maxy):
+    """Community-view cases: non-draft reports whose displayed point (always the
+    legacy area centroid) intersects the viewport. Reports already publicised by
+    a published, unexpired advisory are skipped so the advisory pin is not
+    duplicated by the case's own pin."""
+    if not spatial.postgis_active(db):
+        return None
+    sql = (
+        'SELECT r.id FROM reports r JOIN areas a ON a.id = r.area_id '
+        'WHERE r.state != :draft '
+        'AND NOT EXISTS ('
+        '  SELECT 1 FROM advisories av WHERE av.report_id = r.id '
+        '  AND av.state = :published AND av.expires_at > :cutoff) '
+        'AND ST_Intersects(ST_SetSRID(ST_MakePoint(a.longitude, a.latitude), 4326),'
+        '  ST_MakeEnvelope(:minx, :miny, :maxx, :maxy, 4326))')
+    params = {'draft': 'draft', 'published': 'published', 'cutoff': now(),
+              'minx': minx, 'miny': miny, 'maxx': maxx, 'maxy': maxy}
+    if category:
+        sql += ' AND r.category = :category'
         params['category'] = category
     return [row[0] for row in db.execute(text(sql), params).all()]
 

@@ -178,3 +178,40 @@ def test_gist_indexes_exist_for_map_geometry(env):
     assert {'ix_reports_location_geom', 'ix_reports_public_geom'} <= gist
     for col in ('geom', 'centroid', 'bbox', 'simplified_geom'):
         assert f'ix_areas_osm_{col}' in gist
+
+
+def test_community_map_shows_all_cases_at_area_centroids(env):
+    """QA finding: reporter-facing maps showed only advisories, never the
+    cases staff could see. The signed-in community view now pins every
+    non-draft report at its legacy area centroid: a shared precise position
+    never leaks, drafts stay private, and no case code is exposed."""
+    _reviewer(env)
+    with _client(env) as client:
+        login(client, 'reviewer@example.org')
+        # A precise, shared report. The walk happened at NOWHERE, but the
+        # community pin must be community-a's centroid (PARK point) instead.
+        case = new_report(client, area='community-a', lat=NOWHERE_LAT, lon=NOWHERE_LON, share=True)
+        submit(client, case['id'])
+        # A draft must never appear on the community map.
+        draft = new_report(client, area='wetland-a', lat=DISTRICT_LAT, lon=DISTRICT_LON, share=False)
+        # A submitted case whose precise point is INSIDE the viewport but whose
+        # centroid (community-b) is not must stay excluded: the bbox filter
+        # runs on the displayed centroid, never on the private position.
+        far = new_report(client, area='community-b', lat=PARK_LAT, lon=PARK_LON, share=True)
+        submit(client, far['id'])
+
+        # Tight park viewport: community-a's centroid (the PARK point) is
+        # inside; the other fixture centroids are outside.
+        body = client.get('/api/v1/map?view=community&bbox=31.05,0.10,31.15,0.20&zoom=14').json()
+        kinds = {f['id']: f['properties']['kind'] for f in body['features']}
+        assert kinds.get(draft['id']) is None, 'drafts must stay private on the community map'
+        assert kinds.get(far['id']) is None, 'exclusion runs on the displayed centroid, not the private point'
+        assert kinds.get(case['id']) == 'report', 'open cases must appear on the community map'
+
+        feat = next(f for f in body['features'] if f['id'] == case['id'])
+        # Pinned at the legacy area centroid, never at the precise NOWHERE fix.
+        assert tuple(feat['geometry']['coordinates']) == (PARK_LON, PARK_LAT)
+        assert feat['properties']['precision'] == 'community-centroid'
+        assert feat['properties']['state'] == 'submitted'
+        assert 'code' not in feat['properties']
+        assert 'redacted' not in feat['properties']
