@@ -178,3 +178,77 @@ denied / ok / unsupported, manual pick, debounced place search, opt-in save,
 - **Browser-side preciseness.** The exact GPS fix lives only in React state
   during the session; nothing client-side persists it, and the only server-side
   record is the coarsened opt-in point.
+
+---
+
+## 8. QA findings from the geographic-areas rollout — all resolved
+
+QA raised four findings after the previous release. Each is fixed on
+`feature/public-nearby`; backend HEAD (this branch) and frontend HEAD
+`e5a386c` (pushed).
+
+**1. Only dashboard-overview and near-me maps drew; other maps stuck.**
+Root cause: `CommunityMap` / `MapWorkspace` pass `viewport: true` but gate
+`MapPanel` (the only component that *reports* the viewport back to
+`useMapData`) behind `d.data`, while `useMapData` intentionally skipped the
+first no-bbox fetch while `applied` was `null` — a deadlock, so `<Loading/>`
+rendered forever (the dashboard works only because it omits `viewport: true`).
+Fixed in `src/lib/useMapData.ts`: a viewport map now fetches the default
+no-bbox scope on first paint so `MapPanel` can mount, and the guard became
+`opts.viewport && !applied && data` so content is kept between viewport
+settles. `data` is deliberately not an effect dependency (would re-fetch
+forever on interval screens). Pages still gate `MapPanel` on `d.data`, so the
+viewport-scoped `/map` fetching design (no bbox query when the map is not
+visible) is unchanged. Rewrote the three `useMapData.test.tsx` tests for the
+new first-paint contract; verified live at `#/workspace/map` and
+`#/community/map` (headless reload after signing in: maps render,
+`loadingText: 0`).
+
+**2. "Map" nav item hung on "Loading your workspace…".** Same single deadlock
+as (1); resolved by the same `useMapData` change and verified live with a
+cookie-authenticated reload.
+
+**3. Near-me map showed no spots.** Bug-free behavior, empty data: the live DB
+only had advisories in far-western Uganda. Data fix —
+`app/seed_demo_advisories.py` (committed; idempotent via
+`repo.client_id LIKE 'demo-nearby-%'`; refuses `production`) seeds three
+published demo advisories around Entebbe/Kampala — Entebbe wildlife
+(`EG-DEMO-W-905`, area 823, 0.058, 32.453), Kampala flood (`EG-DEMO-F-906`,
+area 858, 0.296, 32.587), Entebbe wetland (`EG-DEMO-L-907`, area 857,
+0.022, 32.441). Each is a full verified report + review + case event +
+advisory authored/published by an admin/publisher, with the location stored
+only via `spatial.store_report_location(..., 'generalised', 'manual')` — the
+~1 km grid point, never the precise fix. Verified live: `/public/nearby` from
+0.058,32.453 returns the wildlife + wetland cases; the near-me page with the
+Entebbe City district pick shows **"2 within 10 km"** (148 overlay paths =
+146 districts + 2 case circles).
+
+**4. Report forms still listed static community locations.** The legacy
+`areas` table only carried the 3 demo rows. Data migration
+`alembic/versions/0006_areas_osm_districts.py` mirrors the OSM district import
+into `areas` (id = `a.id::text`, name = `COALESCE(display_name, name)`,
+centroid lat/lon, radius 10.0, description marker `'OSM district area
+imported from the Uganda extract.'`, idempotent `NOT EXISTS`, guarded to
+Postgres with `areas_osm` present; downgrade deletes by marker). `/areas` now
+serves 149 rows incl. real districts (Entebbe City `823`, Kampala `858`,
+Wakiso `857`, Kasese `890`). `ReportForm` (`src/pages/Community.tsx`) replaced
+the raw `<select>` with a searchable district picker (`area-picker` input +
+name-filtered `area-results` list; `onMouseDown` preventDefault keeps focus;
+a pick sets `draft.area_id` and shows the chosen name; `next()` now guards a
+missing `area_id` with a clear message). The Profile "Follow communities" list
+(149 checkboxes) got a filter input. Verified live, signed in: type "Ent" in
+the picker → "Entebbe City / OSM district area imported from the Uganda
+extract." appears → selecting it persists the choice.
+
+Whole-suite state after this roll-out: backend **161 passed**, frontend
+**53 passed**, `tsc -b` clean.
+
+**Operational note (not a code defect).** During verification the live login
+started returning 401 for valid credentials. Non-superuser diagnosis: an
+index-scan `WHERE email='…'` returned no rows while a forced sequential scan
+did — the `ix_users_email` btree had a stale TID (autovacuum had pruned the
+old heap line pointer after an earlier in-place update). Fix: terminate the
+stuck `idle in transaction` connections (13 present; they also block
+`REINDEX`), then `REINDEX TABLE` on the touched tables, then restart the API.
+Added to the runbook: if valid credentials 401, check
+`SET enable_indexscan=off` before blaming auth code.
