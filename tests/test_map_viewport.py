@@ -215,3 +215,31 @@ def test_community_map_shows_all_cases_at_area_centroids(env):
         assert feat['properties']['state'] == 'submitted'
         assert 'code' not in feat['properties']
         assert 'redacted' not in feat['properties']
+
+
+def test_community_map_needs_no_account_but_staff_view_stays_gated(env):
+    """The public landing map is the community view served with no account.
+
+    It must answer an anonymous, cookie-less request with the same area-centre
+    payload — never a precise fix — while the staff view keeps its role gate so
+    nothing that used to require a staff session becomes public.
+    """
+    _reviewer(env)
+    with _client(env) as client:
+        login(client, 'reviewer@example.org')
+        case = new_report(client, area='community-a', lat=NOWHERE_LAT, lon=NOWHERE_LON, share=True)
+        submit(client, case['id'])
+
+    with _client(env) as anon:  # a brand-new client: no session cookie at all
+        response = anon.get('/api/v1/map?view=community&bbox=31.05,0.10,31.15,0.20&zoom=14')
+        assert response.status_code == 200, 'the public landing map must need no account'
+        payload = response.json()
+        assert payload['type'] == 'FeatureCollection'
+        feat = next(f for f in payload['features'] if f['id'] == case['id'])
+        # Same public generalisation as the signed-in community view.
+        assert tuple(feat['geometry']['coordinates']) == (PARK_LON, PARK_LAT)
+        assert feat['properties']['precision'] == 'community-centroid'
+        assert 'code' not in feat['properties']
+        # The staff view is still not public.
+        staff = anon.get('/api/v1/map?view=staff&bbox=31.05,0.10,31.15,0.20&zoom=14')
+        assert staff.status_code in (401, 403)

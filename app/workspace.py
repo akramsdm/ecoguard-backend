@@ -11,7 +11,7 @@ from .db import get_db
 from .config import get_settings
 from .models import User,Area,Report,Advisory,Audit,Outbox,LoginSession,now
 from .schemas import UserCreate,UserAccess,AreaCreate
-from .security import current_user,require_role,hash_password,audit,is_case_staff
+from .security import current_user, current_user_optional, require_role, hash_password, audit, is_case_staff
 from .reports import visible_query,report_view,serialize_report
 from .auth import user_view
 from . import ai
@@ -118,7 +118,7 @@ def map_data(view: str = Query('community', pattern='^(community|staff)$'),
              category: str | None = None,
              bbox: str | None = Query(None, description='minLon,minLat,maxLon,maxLat'),
              zoom: int | None = Query(None, ge=0, le=22),
-             user: User = Depends(current_user), db: Session = Depends(get_db)):
+             user: User | None = Depends(current_user_optional), db: Session = Depends(get_db)):
     """Viewport-scoped map data with low-zoom clustering.
 
     The client sends the current viewport (``bbox``, ``zoom``); the server
@@ -127,6 +127,12 @@ def map_data(view: str = Query('community', pattern='^(community|staff)$'),
     Staff responses are cached per user (the full/redacted split depends on
     their assignments); everything carries a cache key built from
     view + bbox + zoom + category.
+
+    The community view is the *public* map behind the unauthenticated landing
+    page, so it is served to anonymous visitors as well: it only ever exposes
+    area-centre pins, case titles/states and published advisory titles (no
+    evidence, no reporter identity, no precise position). The staff view keeps
+    its role gate and still 401s/403s without an admitted account.
     """
     cfg = get_settings()
     minx, miny, maxx, maxy = DEFAULT_BBOX
@@ -138,15 +144,18 @@ def map_data(view: str = Query('community', pattern='^(community|staff)$'),
         # Admins are included deliberately: excluding them hid staff cases from the
         # operators who manage access. This exposes other people's report titles and,
         # for shared locations, private positions -- but only within assigned areas.
+        if not user:
+            raise HTTPException(401, 'Please sign in again.')
         require_role(user, 'reviewer', 'responder', 'publisher', 'admin')
         key = f'map:staff:{user.id}:{category or "all"}:z{z}:{rbox}'
         hit = cache.get(key)
         body = hit if hit is not None else cache.cached(key, cfg.cache_ttl_seconds,
                                                         lambda: _staff_map(db, user, category, minx, miny, maxx, maxy, z))
     else:
-        # Signed-in community view: published advisories plus every non-draft
+        # Public community view: published advisories plus every non-draft
         # case pinned at its legacy area centroid. Private positions never
-        # leave the server, so the cache stays view-scoped and shared.
+        # leave the server, so the cache stays view-scoped and shared -- and
+        # safe to serve to the anonymous landing page.
         key = f'map:community:{category or "all"}:z{z}:{rbox}'
         hit = cache.get(key)
         body = hit if hit is not None else cache.cached(key, cfg.cache_ttl_seconds,

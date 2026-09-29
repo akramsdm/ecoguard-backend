@@ -20,20 +20,33 @@ def token_hash(token): return hashlib.sha256(token.encode()).hexdigest()
 def audit(db, user, action, target=''):
     db.add(Audit(actor_id=user.id if user else None, action=action, target_id=target))
 
-def current_user(request: Request, db: Session = Depends(get_db)) -> User:
+def _authenticate(request: Request, db: Session, required: bool = True) -> User | None:
     token = request.cookies.get(get_settings().session_cookie, '')
     session = db.get(LoginSession, token_hash(token)) if token else None
     if not session or session.expires_at <= time.time():
-        raise HTTPException(401, 'Please sign in again.')
+        if required:
+            raise HTTPException(401, 'Please sign in again.')
+        return None
     user = db.get(User, session.user_id)
     if not user or not user.active:
-        raise HTTPException(401, 'Account is unavailable.')
+        if required:
+            raise HTTPException(401, 'Account is unavailable.')
+        return None
     if request.method not in ('GET','HEAD','OPTIONS'):
         csrf = request.headers.get('x-csrf-token', '')
         if not csrf or not secrets.compare_digest(csrf, session.csrf):
             raise HTTPException(403, 'CSRF validation failed. Reload and try again.')
     request.state.session = session
     return user
+
+
+def current_user(request: Request, db: Session = Depends(get_db)) -> User:
+    user = _authenticate(request, db, required=True)
+    return user  # type: ignore[return-value]
+
+
+def current_user_optional(request: Request, db: Session = Depends(get_db)) -> User | None:
+    return _authenticate(request, db, required=False)
 
 def require_role(user, *roles):
     if not set(user.roles).intersection(roles):
