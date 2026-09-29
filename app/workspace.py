@@ -1,4 +1,5 @@
 from collections import Counter
+import json
 from pathlib import Path
 from fastapi import APIRouter,Depends,HTTPException,Query
 from alembic.config import Config
@@ -152,6 +153,22 @@ def _community_features(db,category):
 @router.get('/team/directory')
 def directory(user:User=Depends(current_user),db:Session=Depends(get_db)):
     require_role(user,'reviewer','responder','publisher','admin')
+    if spatial.postgis_active(db):
+        # Overlap is decided by live assignments (areas_osm ids). The legacy
+        # User.areas mirror is a mix of legacy keys and OSM ids after the
+        # migration, so it can no longer be compared across users.
+        rows=db.execute(text(
+            'SELECT DISTINCT u.id, u.name, u.roles::text AS roles_text '
+            'FROM users u '
+            'JOIN user_area_assignments mine ON mine.user_id = :me AND mine.revoked_at IS NULL '
+            'JOIN user_area_assignments ua ON ua.user_id = u.id '
+            '   AND ua.area_osm_id = mine.area_osm_id AND ua.revoked_at IS NULL '
+            'JOIN areas_osm a ON a.id = ua.area_osm_id AND a.active '
+            "WHERE u.active AND u.roles::jsonb ?| ARRAY['reviewer','responder','publisher'] "
+            'ORDER BY u.name'), {'me': user.id}).mappings().all()
+        return {'items':[{'id':r['id'],'name':r['name'],
+            'roles':json.loads(r['roles_text']),
+            'areas':list(spatial.active_area_ids(db,r['id']))} for r in rows]}
     return {'items':[{'id':u.id,'name':u.name,'roles':u.roles,'areas':u.areas} for u in db.query(User).filter_by(active=True).all()
         if set(u.areas).intersection(user.areas) and set(u.roles).intersection({'reviewer','responder','publisher'})]}
 
@@ -205,7 +222,7 @@ def admin_dashboard(user:User=Depends(current_user),db:Session=Depends(get_db)):
 @router.get('/admin/users')
 def users(user:User=Depends(current_user),db:Session=Depends(get_db)):
     require_role(user,'admin')
-    return {'items':[user_view(u) for u in db.query(User).order_by(User.created_at).limit(1000).all()]}
+    return {'items':[user_view(u,db) for u in db.query(User).order_by(User.created_at).limit(1000).all()]}
 
 @router.post('/admin/users',status_code=201)
 def create_user(payload:UserCreate,user:User=Depends(current_user),db:Session=Depends(get_db)):
@@ -218,7 +235,7 @@ def create_user(payload:UserCreate,user:User=Depends(current_user),db:Session=De
     if spatial.postgis_active(db):
         spatial.set_assignments(db,u.id,[int(a) for a in payload.areas],assigned_by=user.id)
     audit(db,user,'access.user_created',u.id);db.commit()
-    return user_view(u)
+    return user_view(u, db)
 
 def check_areas(db,ids):
     """Validate the ``areas`` payload.
@@ -266,7 +283,85 @@ def access(user_id:str,payload:UserAccess,user:User=Depends(current_user),db:Ses
         spatial.set_assignments(db,u.id,[int(a) for a in payload.areas],assigned_by=user.id)
     db.query(LoginSession).filter_by(user_id=u.id).delete(synchronize_session=False)
     audit(db,user,'access.updated_sessions_revoked',u.id);db.commit()
-    return user_view(u)
+    return user_view(u, db)
+
+@router.get('/my-areas')
+def my_areas(user:User=Depends(current_user),db:Session=Depends(get_db)):
+    """A staff member's own live area assignments with open-case load.
+
+    The legacy ``user.areas`` mirror may still hold pre-migration keys or a mix
+    of keys and OSM ids, so the authoritative assignment set and its display
+    names come from ``user_area_assignments`` + ``areas_osm``.
+    """
+    require_role(user,'reviewer','responder','publisher','admin')
+    if not spatial.postgis_active(db):
+        return {'items': []}
+    rows=db.execute(text(
+        'SELECT ua.area_osm_id, a.name, a.display_name, a.area_type, '
+        '(SELECT count(*) FROM report_areas ra JOIN reports r ON r.id = ra.report_id '
+        " WHERE ra.area_osm_id = ua.area_osm_id "
+        " AND r.state IN ('submitted','under_review','needs_evidence')) AS open_cases, "
+        '(SELECT count(*) FROM report_areas ra JOIN reports r ON r.id = ra.report_id '
+        " WHERE ra.area_osm_id = ua.area_osm_id AND r.state <> 'draft') AS total_cases "
+        'FROM user_area_assignments ua JOIN areas_osm a ON a.id = ua.area_osm_id '
+        'WHERE ua.user_id = :uid AND ua.revoked_at IS NULL AND a.active '
+        'ORDER BY a.name IS NULL, a.name'), {'uid': user.id}).mappings().all()
+    return {'items':[{
+        'area_osm_id': r['area_osm_id'],
+        'name': r['name'] or r['display_name'] or f"OSM area {r['area_osm_id']}",
+        'area_type': r['area_type'],
+        'open_cases': r['open_cases'],
+        'total_cases': r['total_cases']} for r in rows]}
+
+
+@router.get('/admin/areas-osm/coverage')
+def area_coverage(user:User=Depends(current_user),db:Session=Depends(get_db)):
+    """Per-OSM-area load and staffing for access administrators.
+
+    Deliberately uncached: after assigning or deactivating an area the next read
+    must reflect it. Counts come from ``report_areas`` (the containment cache)
+    so an area's open load is real, not derived from a legacy centroid.
+    """
+    require_role(user,'admin')
+    if not spatial.postgis_active(db):
+        return {'items': [], 'total': 0}
+    rows=db.execute(text(
+        'WITH area_stats AS ('
+        '  SELECT ra.area_osm_id,'
+        "    count(*) FILTER (WHERE r.state <> 'draft') AS total_cases,"
+        "    count(*) FILTER (WHERE r.state IN "
+        "      ('submitted','under_review','needs_evidence')) AS open_cases "
+        '  FROM report_areas ra JOIN reports r ON r.id = ra.report_id '
+        '  GROUP BY ra.area_osm_id),'
+        'assignments_count AS ('
+        '  SELECT ua.area_osm_id, count(DISTINCT ua.user_id) AS assigned_staff '
+        '  FROM user_area_assignments ua JOIN users u ON u.id = ua.user_id '
+        "  WHERE ua.revoked_at IS NULL AND u.active "
+        "  AND u.roles::jsonb ?| ARRAY['reviewer','responder','publisher','admin'] "
+        '  GROUP BY ua.area_osm_id)'
+        'SELECT a.id, a.name, a.display_name, a.area_type, a.active,'
+        '  COALESCE(st.total_cases,0) AS total_cases,'
+        '  COALESCE(st.open_cases,0) AS open_cases,'
+        '  COALESCE(ac.assigned_staff,0) AS assigned_staff,'
+        '  CASE WHEN COALESCE(st.total_cases,0) > 0 AND COALESCE(ac.assigned_staff,0) = 0 '
+        '       THEN true ELSE false END AS needs_staff '
+        'FROM areas_osm a '
+        'LEFT JOIN area_stats st ON st.area_osm_id = a.id '
+        'LEFT JOIN assignments_count ac ON ac.area_osm_id = a.id '
+        'WHERE a.active OR COALESCE(st.total_cases,0) > 0 '
+        'ORDER BY st.open_cases DESC NULLS LAST, a.name IS NULL, a.name'
+    )).mappings().all()
+    items=[{
+        'id': r['id'],
+        'name': r['name'] or r['display_name'] or f'OSM area {r["id"]}',
+        'area_type': r['area_type'],
+        'active': r['active'],
+        'total_cases': r['total_cases'],
+        'open_cases': r['open_cases'],
+        'assigned_staff': r['assigned_staff'],
+        'needs_staff': r['needs_staff']} for r in rows]
+    return {'items': items, 'total': len(items)}
+
 
 @router.get('/admin/audit')
 def audit_log(user:User=Depends(current_user),db:Session=Depends(get_db)):

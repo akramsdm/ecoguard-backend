@@ -19,6 +19,8 @@ from sqlalchemy.orm import Session
 
 from .config import get_settings
 from .db import get_db
+from .security import current_user, require_role, audit
+from .schemas import AreaActive
 
 router = APIRouter(tags=['areas-osm'])
 
@@ -56,7 +58,7 @@ def _parse_bbox(value: str) -> tuple[float, float, float, float]:
 def _select_columns(include_geometry: bool) -> list:
     cols = [
         'a.id', 'a.osm_type', 'a.osm_id', 'a.area_type', 'a.admin_level',
-        'a.name', 'a.display_name', 'a.source_version',
+        'a.name', 'a.display_name', 'a.source_version', 'a.active',
         'ST_AsGeoJSON(a.centroid) AS centroid',
     ]
     if include_geometry:
@@ -115,6 +117,7 @@ def list_areas_osm(
             'name': row['name'],
             'display_name': row['display_name'],
             'source_version': row['source_version'],
+            'active': row['active'],
             'centroid': json.loads(row['centroid']),
         }
         if include_geometry:
@@ -175,3 +178,23 @@ def get_area_osm(area_id: int, db: Session = Depends(get_db)):
         'simplified_geom': json.loads(row['simplified_geom']),
         'attribution': _osm_attribution(),
     }
+
+
+@router.patch('/admin/areas-osm/{area_id}')
+def set_area_active(area_id: int, payload: AreaActive,
+                    user=Depends(current_user), db: Session = Depends(get_db)):
+    """Toggle whether an OSM area may be assigned and used for containment.
+
+    Deactivating an area does not delete its assignments or report_areas rows;
+    it only stops them counting: ``active_area_ids``/rebuild/assignment-validity
+    all filter on ``active``. History and evidence stay in place.
+    """
+    require_role(user, 'admin')
+    result = db.execute(text(
+        'UPDATE areas_osm SET active = :v, updated_at = now() WHERE id = :id'
+    ), {'v': payload.active, 'id': area_id})
+    if result.rowcount == 0:
+        raise HTTPException(404, 'OSM area not found')
+    audit(db, user, 'area.osm_active_changed', str(area_id))
+    db.commit()
+    return {'id': area_id, 'active': payload.active}

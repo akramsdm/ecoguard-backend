@@ -46,6 +46,10 @@ class AreaCreate(Strict):
     longitude: float = Field(ge=-180, le=180)
     radius_km: float = Field(default=10, ge=1, le=500)
 
+class AreaActive(Strict):
+    """Whether an OSM area may be assigned to staff and used for containment."""
+    active: bool
+
 class ReportWrite(Strict):
     client_id: str = Field(min_length=8, max_length=64)
     category: Category

@@ -7,12 +7,24 @@ from .config import get_settings
 from .models import User, LoginSession, Area
 from .schemas import Register, Login, Preferences, PasswordChange
 from .security import current_user, hash_password, verify_password, token_hash, limiter, audit, DUMMY_HASH
+from . import spatial
 
 router = APIRouter(prefix='/auth', tags=['Authentication'])
 
-def user_view(user):
-    return {'id': user.id, 'name': user.name, 'email': user.email, 'roles': user.roles,
-            'areas': user.areas, 'preferences': user.preferences, 'active': user.active}
+def user_view(user, db=None):
+    """Public account card for the current session and for administrators.
+
+    ``areas`` remains the deprecated legacy mirror (kept for the SQLite harness
+    and the community report form). ``assignments`` carries the authoritative
+    live OSM assignments (``user_area_assignments`` joined to ``areas_osm``),
+    so the admin picker and "my areas" render names instead of raw ids — the
+    mirror's values are no longer a reliable source after the OSM migration.
+    """
+    payload = {'id': user.id, 'name': user.name, 'email': user.email, 'roles': user.roles,
+               'areas': user.areas, 'preferences': user.preferences, 'active': user.active}
+    payload['assignments'] = (spatial.active_assignment_names(db, user.id)
+                              if db is not None else [])
+    return payload
 
 def start_session(db, user, response, request):
     cfg = get_settings()
@@ -28,7 +40,7 @@ def start_session(db, user, response, request):
     samesite = cfg.session_samesite if cfg.session_samesite in ('lax', 'strict', 'none') else 'lax'
     response.set_cookie(cfg.session_cookie, token, httponly=True, secure=cfg.cookie_secure,
         samesite=samesite, max_age=cfg.session_hours*3600, path='/')
-    return {'user': user_view(user), 'csrf_token': csrf}
+    return {'user': user_view(user, db), 'csrf_token': csrf}
 
 @router.post('/register', status_code=201)
 def register(payload: Register, request: Request, response: Response, db: Session=Depends(get_db)):
@@ -51,8 +63,8 @@ def login(payload: Login, request: Request, response: Response, db: Session=Depe
     return start_session(db,user,response,request)
 
 @router.get('/me')
-def me(request: Request, user: User=Depends(current_user)):
-    return {'user': user_view(user), 'csrf_token': request.state.session.csrf}
+def me(request: Request, user: User=Depends(current_user), db: Session=Depends(get_db)):
+    return {'user': user_view(user, db), 'csrf_token': request.state.session.csrf}
 
 @router.post('/logout', status_code=204)
 def logout(request: Request, response: Response, user: User=Depends(current_user), db: Session=Depends(get_db)):
@@ -66,7 +78,7 @@ def preferences(payload: Preferences, user: User=Depends(current_user), db: Sess
     user.name=payload.name
     user.preferences=payload.model_dump(exclude={'name'})
     audit(db,user,'profile.updated',user.id); db.commit()
-    return user_view(user)
+    return user_view(user, db)
 
 @router.post('/password', status_code=204)
 def password(payload: PasswordChange, request: Request, response: Response,

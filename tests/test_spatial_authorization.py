@@ -664,3 +664,120 @@ def test_advisory_out_of_area_staff_sees_redacted_and_cannot_edit(env):
             'version': 2, 'privacy_checked': True, 'evidence_checked': True}).status_code == 403
         assert client.post(f"/api/v1/advisories/{adv['id']}/retract", json={
             'version': 2, 'reason': 'Cannot retract what is not mine to see.'}).status_code == 403
+
+
+# --------------------------------------------------------------------------- #
+# Step-4 API surface: assignment exposure, area active toggle, coverage, my-areas
+# --------------------------------------------------------------------------- #
+def test_admin_users_and_me_expose_live_assignments(env):
+    """user_view carries assignments so the picker works after any dual-write."""
+    _, uid = _admin_and_target(env)
+    with _client(env) as client:
+        login(client, 'admin@example.org')
+        r = client.patch(f'/api/v1/admin/users/{uid}', json={
+            'roles': ['reviewer'], 'areas': [str(env['ids']['park'])], 'active': True})
+        assert r.status_code == 200, r.text
+        assert r.json()['assignments'] == [{
+            'area_osm_id': env['ids']['park'], 'name': 'Fixture National Park',
+            'area_type': 'national_park'}]
+        # A fresh read of the directory reflects the write (no re-login needed).
+        users = client.get('/api/v1/admin/users').json()['items']
+        target = next(u for u in users if u['id'] == uid)
+        assert {a['area_osm_id'] for a in target['assignments']} == {env['ids']['park']}
+        # Reassign: the picker sees the change on the very next read.
+        r = client.patch(f'/api/v1/admin/users/{uid}', json={
+            'roles': ['reviewer'], 'areas': [str(env['ids']['district'])], 'active': True})
+        assert r.status_code == 200, r.text
+        users = client.get('/api/v1/admin/users').json()['items']
+        target = next(u for u in users if u['id'] == uid)
+        assert {a['area_osm_id'] for a in target['assignments']} == {env['ids']['district']}
+        assert target['assignments'][0]['name'] == 'Fixture District'
+
+
+def test_areas_osm_list_exposes_active_flag(env):
+    with _client(env) as client:
+        # The list is public (stable public facts only), like the single read.
+        data = client.get('/api/v1/areas-osm', params={'limit': 100}).json()
+        assert data['total'] >= 2
+        assert all('active' in i for i in data['items'])
+        park = next(i for i in data['items'] if i['id'] == env['ids']['park'])
+        assert park['active'] is True
+        with env['engine'].begin() as conn:
+            conn.execute(text('UPDATE areas_osm SET active = false WHERE id = :i'),
+                         {'i': env['ids']['park']})
+        data = client.get('/api/v1/areas-osm', params={'limit': 100}).json()
+        park = next(i for i in data['items'] if i['id'] == env['ids']['park'])
+        assert park['active'] is False
+
+
+def test_admin_toggles_osm_area_active(env):
+    env['seed'].add_user('reviewer_park@example.org', 'Park Reviewer',
+                         ['reviewer'], osm_ids=[env['ids']['park']])
+    with _client(env) as client:
+        login(client, 'admin@example.org')
+        off = client.patch(f"/api/v1/admin/areas-osm/{env['ids']['park']}",
+                           json={'active': False})
+        assert off.status_code == 200 and off.json()['active'] is False
+        # A deactivated area can no longer be assigned (valid_assignment_ids).
+        _, uid = _admin_and_target(env)
+        refused = client.patch(f'/api/v1/admin/users/{uid}', json={
+            'roles': ['reviewer'], 'areas': [str(env['ids']['park'])], 'active': True})
+        assert refused.status_code == 422
+        on = client.patch(f"/api/v1/admin/areas-osm/{env['ids']['park']}",
+                          json={'active': True})
+        assert on.status_code == 200 and on.json()['active'] is True
+        accepted = client.patch(f'/api/v1/admin/users/{uid}', json={
+            'roles': ['reviewer'], 'areas': [str(env['ids']['park'])], 'active': True})
+        assert accepted.status_code == 200, accepted.text
+        assert client.patch('/api/v1/admin/areas-osm/99999999',
+                            json={'active': True}).status_code == 404
+        # Non-admins cannot toggle areas; a signed-out caller cannot either.
+        env['seed'].add_user('reviewer_out@example.org', 'Outsider', ['reviewer'])
+        login(client, 'reviewer_out@example.org')
+        assert client.patch(f"/api/v1/admin/areas-osm/{env['ids']['park']}",
+                            json={'active': False}).status_code == 403
+
+
+def test_admin_area_coverage_reports_open_load_and_staffing(env):
+    env['seed'].add_user('reviewer_park@example.org', 'Park Reviewer',
+                         ['reviewer'], osm_ids=[env['ids']['park']])
+    with _client(env) as client:
+        _submitted_report_in_park(env, client)  # leaves the session as reporter
+        login(client, 'admin@example.org')
+        cover = client.get('/api/v1/admin/areas-osm/coverage')
+        assert cover.status_code == 200, cover.text
+        items = {i['id']: i for i in cover.json()['items']}
+        park = items[env['ids']['park']]
+        assert park['active'] is True
+        assert park['total_cases'] >= 1 and park['open_cases'] >= 1
+        assert park['assigned_staff'] >= 1 and park['needs_staff'] is False
+        district = items.get(env['ids']['district'])
+        assert district is not None
+        # The district contains the park point too, so the same report counts there.
+        assert district['open_cases'] >= 1
+        # Coverage is admin-only.
+        env['seed'].add_user('reviewer_out@example.org', 'Outsider', ['reviewer'])
+        login(client, 'reviewer_out@example.org')
+        assert client.get('/api/v1/admin/areas-osm/coverage').status_code == 403
+
+
+def test_my_areas_returns_own_assignments_with_open_case_load(env):
+    env['seed'].add_user('reviewer_park@example.org', 'Park Reviewer',
+                         ['reviewer'], osm_ids=[env['ids']['park']])
+    with _client(env) as client:
+        _submitted_report_in_park(env, client)  # creates reporter@example.org
+        login(client, 'reviewer_park@example.org')
+        mine = client.get('/api/v1/my-areas')
+        assert mine.status_code == 200, mine.text
+        items = mine.json()['items']
+        assert len(items) == 1
+        assert items[0]['area_osm_id'] == env['ids']['park']
+        assert items[0]['name'] == 'Fixture National Park'
+        assert items[0]['open_cases'] >= 1 and items[0]['total_cases'] >= 1
+        # A staff member with no assignments gets an empty list, not an error.
+        env['seed'].add_user('reviewer_out@example.org', 'Outsider', ['reviewer'])
+        login(client, 'reviewer_out@example.org')
+        assert client.get('/api/v1/my-areas').json()['items'] == []
+        # A plain reporter is not staff: 403.
+        login(client, 'reporter@example.org')
+        assert client.get('/api/v1/my-areas').status_code == 403
