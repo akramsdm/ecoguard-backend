@@ -119,7 +119,10 @@ wildlife/forest reserves) are imported into `areas_osm` and exposed read-only at
 `GET /api/v1/areas-osm` (list: bbox, `area_type`, `q` text search, pagination)
 and `GET /api/v1/areas-osm/{id}` (full geometry). Both responses carry the OSM
 attribution string, which is also published in `GET /api/v1/config` under
-`osm_attribution` for the frontend.
+`osm_attribution` for the frontend. List items now also carry the `active` gate
+used by the frontend assignment picker; an administrator toggles that gate with
+`PATCH /api/v1/admin/areas-osm/{id}` — audited and non-destructive: deactivating
+an area stops its assignments and containment counts (nothing is deleted).
 
 Importing is a manual, idempotent operation that never runs on API startup:
 
@@ -213,6 +216,11 @@ assignment overlapping the report's areas):
 | `POST .../advisories/publish` · `POST .../retract` | 200 | 200 | 403 | n/a |
 | `GET /reports/export.csv` | own rows only | acting areas only | acting areas only | n/a |
 | `PATCH /admin/users/{id}` `POST /admin/users` | dual-write `User.areas` **and** assignments (by OSM area id) | | | |
+| `GET /admin/users` · `/auth/me` | `user_view` also returns live `assignments` (OSM id, name, type) so the picker and my-areas never read the legacy `User.areas` mirror | | | |
+| `GET /areas-osm` (list) | public; items include the `active` assignment gate | | | |
+| `PATCH /admin/areas-osm/{id}` | admin-only active toggle (audited, non-destructive) | | | |
+| `GET /admin/areas-osm/coverage` | admin-only per-area open load + staff count (uncached) | | | |
+| `GET /my-areas` | staff-only own assignments with open-case counts | | | |
 
 A redacted view omits `title`, `code`, `description`, `species`, contact
 fields, evidence, messages, reviewer notes, assignee and precise coordinates —
