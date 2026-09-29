@@ -195,11 +195,12 @@ def test_the_realtime_stream_requires_a_session(client):
     assert client.get('/api/v1/stream').status_code == 401
 
 
-def test_the_realtime_stream_route_is_guarded_by_the_session_dependency():
-    """The SSE response never ends, so a live 200 cannot be asserted without hanging
-    the suite. Asserting the guard is wired to the route catches the same regression
-    that the 401 above would catch, without opening a connection that never closes."""
+def test_the_realtime_stream_does_not_hold_a_db_session_for_its_lifetime():
+    """A streaming response that never ends must not depend on get_db(): FastAPI keeps
+    yield-dependencies alive until the response completes, so current_user() would park
+    one pool connection in an open transaction for the whole stream. The route guards
+    with a helper that closes its session before streaming starts."""
     from app.main import app
     from app.security import current_user
     route = next(r for r in app.routes if getattr(r, 'path', '') == '/api/v1/stream')
-    assert current_user in {dependency.call for dependency in route.dependant.dependencies}
+    assert current_user not in {dependency.call for dependency in route.dependant.dependencies}
