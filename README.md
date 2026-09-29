@@ -212,6 +212,7 @@ assignment overlapping the report's areas):
 | `GET .../evidence` · `.../messages` | 200 | 200 | 403 | 404 |
 | `POST .../messages` | 201 (owner/submitter/in-area) | 201 | 403 | 404 |
 | `GET /map?view=staff` · `/dashboard` | own cases | full rows | redacted rows | n/a |
+| `GET /map` (both views) | accepts `bbox` + `zoom` (viewport-scoped, no hard cap); points cluster at zoom < 10; response carries `clusters`, boundary `areas` (assigned solid / out-of-area muted) and a `debug.cache_key` built from view+bbox+zoom+category | | | |
 | `GET /advisories` (staff) | full | full | redacted | n/a |
 | `POST .../advisories/publish` · `POST .../retract` | 200 | 200 | 403 | n/a |
 | `GET /reports/export.csv` | own rows only | acting areas only | acting areas only | n/a |

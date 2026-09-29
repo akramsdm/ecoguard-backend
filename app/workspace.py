@@ -1,3 +1,4 @@
+import math
 from collections import Counter
 import json
 from pathlib import Path
@@ -16,6 +17,7 @@ from .auth import user_view
 from . import ai
 from . import spatial
 from .cache import cache,touch
+from .osm_areas import _parse_bbox
 
 router=APIRouter(tags=['Workspace, maps, administration'])
 
@@ -103,52 +105,249 @@ def _dashboard_rows(db,user):
         'scope':'assigned areas and own reports' if is_case_staff(user) else 'your reports',
         'ai_metrics':None,'note':'Operational counts are not field-impact or model-accuracy measurements.'}
 
+# Default country viewport (Uganda); the client normally sends the live map bounds.
+DEFAULT_BBOX = (29.0, -1.5, 35.5, 4.5)
+# Point features are aggregated into viewport clusters below this zoom; at or
+# above it the individual (already-generalised) points are returned.
+CLUSTER_ZOOM = 10
+CLUSTER_BASE_CELL = 0.09  # degrees at zoom 9; doubles per zoom level below that
+
+
 @router.get('/map')
-def map_data(view:str=Query('community',pattern='^(community|staff)$'),category:str|None=None,
-    user:User=Depends(current_user),db:Session=Depends(get_db)):
-    features=[]
-    cfg=get_settings()
-    if view=='staff':
+def map_data(view: str = Query('community', pattern='^(community|staff)$'),
+             category: str | None = None,
+             bbox: str | None = Query(None, description='minLon,minLat,maxLon,maxLat'),
+             zoom: int | None = Query(None, ge=0, le=22),
+             user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Viewport-scoped map data with low-zoom clustering.
+
+    The client sends the current viewport (``bbox``, ``zoom``); the server
+    filters spatially instead of applying the old hard 1000-feature cap, and
+    aggregates points into clusters at low zooms so the payload stays small.
+    Staff responses are cached per user (the full/redacted split depends on
+    their assignments); everything carries a cache key built from
+    view + bbox + zoom + category.
+    """
+    cfg = get_settings()
+    minx, miny, maxx, maxy = DEFAULT_BBOX
+    if bbox:
+        minx, miny, maxx, maxy = _parse_bbox(bbox)
+    z = zoom if zoom is not None else (8 if view == 'staff' else 7)
+    rbox = f'{minx:.3f},{miny:.3f},{maxx:.3f},{maxy:.3f}'
+    if view == 'staff':
         # Admins are included deliberately: excluding them hid staff cases from the
         # operators who manage access. This exposes other people's report titles and,
         # for shared locations, private positions -- but only within assigned areas.
-        require_role(user,'reviewer','responder','publisher','admin')
-        query=visible_query(db,user)
-        if category:query=query.filter(Report.category==category)
-        rows=query.limit(1000).all()
-        modes=spatial.visibility_map(db,user,rows)
-        for r in rows:
-            area=db.get(Area,r.area_id)
-            if modes.get(r.id,'full')=='redacted':
-                # Out-of-area staff see only the generalised point — no title,
-                # case code or precise coordinates can leak.
-                lon,lat=(r.longitude if r.longitude is not None else area.longitude,
-                         r.latitude if r.latitude is not None else area.latitude)
-                features.append({'type':'Feature','id':r.id,'geometry':{'type':'Point','coordinates':[lon,lat]},
-                    'properties':{'id':r.id,'category':r.category,'state':r.state,
-                        'area_name':area.name,'precision':'generalised','kind':'report','redacted':True}})
-                continue
-            private=r.share_location and r.latitude is not None
-            lon,lat=(r.longitude,r.latitude) if private else (area.longitude,area.latitude)
-            features.append({'type':'Feature','id':r.id,'geometry':{'type':'Point','coordinates':[lon,lat]},
-                'properties':{'id':r.id,'code':r.code,'title':r.title,'category':r.category,'state':r.state,
-                    'area_name':area.name,'precision':'private-evidence' if private else 'community-centroid','kind':'report'}})
+        require_role(user, 'reviewer', 'responder', 'publisher', 'admin')
+        key = f'map:staff:{user.id}:{category or "all"}:z{z}:{rbox}'
+        body = cache.cached(key, cfg.cache_ttl_seconds,
+                            lambda: _staff_map(db, user, category, minx, miny, maxx, maxy, z))
     else:
-        features=cache.cached('map:community:'+(category or 'all'),
-            cfg.cache_ttl_seconds,lambda:_community_features(db,category))
-    return {'type':'FeatureCollection','features':features,'location_policy':'Private positions are never included in community responses.'}
+        # Public output is built only from active, published advisories, not
+        # hidden reports. Cache is view-scoped and shared, like the old key.
+        key = f'map:community:{category or "all"}:z{z}:{rbox}'
+        body = cache.cached(key, cfg.cache_ttl_seconds,
+                            lambda: _community_map(db, category, minx, miny, maxx, maxy, z))
+    debug = dict(body.get('debug') or {})
+    debug['cache_key'] = key
+    return {**body, 'debug': debug}
 
-def _community_features(db,category):
-    features=[]
-    # Public output is built only from active, published advisories, not hidden reports.
-    query=db.query(Advisory).filter(Advisory.state=='published',Advisory.expires_at>now())
-    if category:query=query.filter(Advisory.category==category)
-    for a in query.limit(1000).all():
-        area=db.get(Area,a.area_id)
-        features.append({'type':'Feature','id':a.id,'geometry':{'type':'Point','coordinates':[area.longitude,area.latitude]},
-            'properties':{'id':a.id,'title':a.title,'category':a.category,'state':'published',
-                'area_name':area.name,'precision':'community-centroid','kind':'advisory'}})
-    return features
+
+def _map_body(features, clusters, areas, source):
+    return {'type': 'FeatureCollection', 'features': features, 'clusters': clusters,
+            'areas': areas,
+            'location_policy': 'Private positions are never included in community responses.',
+            'debug': {'source': source, 'clustered': bool(clusters)}}
+
+
+def _staff_map(db, user, category, minx, miny, maxx, maxy, zoom):
+    if spatial.postgis_active(db):
+        ids = _report_ids_in_bbox(db, category, minx, miny, maxx, maxy)
+        if not ids:
+            return _map_body([], [], [], 'db')
+        query = db.query(Report).filter(Report.id.in_(ids))
+        if category:
+            query = query.filter(Report.category == category)
+        rows = query.all()
+    else:
+        # SQLite harness: no spatial filtering, keep the legacy limit + gating.
+        query = visible_query(db, user)
+        if category:
+            query = query.filter(Report.category == category)
+        rows = query.limit(1000).all()
+    modes = spatial.visibility_map(db, user, rows)
+    features, feature_ids = [], []
+    for r in rows:
+        area = db.get(Area, r.area_id)
+        if modes.get(r.id, 'full') == 'redacted':
+            # Out-of-area staff see only the generalised point - no title,
+            # case code or precise coordinates can leak. (If the report has no
+            # stored public point its legacy area centroid stands in.)
+            lon, lat = (r.longitude if r.longitude is not None else area.longitude,
+                        r.latitude if r.latitude is not None else area.latitude)
+            features.append({'type': 'Feature', 'id': r.id,
+                             'geometry': {'type': 'Point', 'coordinates': [lon, lat]},
+                             'properties': {'id': r.id, 'category': r.category, 'state': r.state,
+                                            'area_name': area.name, 'precision': 'generalised',
+                                            'kind': 'report', 'redacted': True}})
+        else:
+            private = r.share_location and r.latitude is not None
+            lon, lat = (r.longitude, r.latitude) if private else (area.longitude, area.latitude)
+            features.append({'type': 'Feature', 'id': r.id,
+                             'geometry': {'type': 'Point', 'coordinates': [lon, lat]},
+                             'properties': {'id': r.id, 'code': r.code, 'title': r.title,
+                                            'category': r.category, 'state': r.state,
+                                            'area_name': area.name,
+                                            'precision': 'private-evidence' if private else 'community-centroid',
+                                            'kind': 'report'}})
+        feature_ids.append(r.id)
+    if spatial.postgis_active(db):
+        features, clusters = _maybe_cluster(features, zoom)
+        areas = _overlay_areas(db, user, feature_ids, minx, miny, maxx, maxy)
+    else:
+        clusters, areas = [], []
+    return _map_body(features, clusters, areas, 'db')
+
+
+def _report_ids_in_bbox(db, category, minx, miny, maxx, maxy):
+    """Reports whose *displayed* point (private precise point, else legacy
+    centroid) intersects the viewport. Preserves the existing private-evidence
+    vs community-centroid mapping: what gets exposed is unchanged, only the
+    fetch is viewport-scoped."""
+    if not spatial.postgis_active(db):
+        return None
+    sql = (
+        'SELECT r.id FROM reports r JOIN areas a ON a.id = r.area_id '
+        'WHERE ST_Intersects(ST_SetSRID(ST_MakePoint('
+        '  CASE WHEN r.share_location AND r.latitude IS NOT NULL THEN r.longitude ELSE a.longitude END,'
+        '  CASE WHEN r.share_location AND r.latitude IS NOT NULL THEN r.latitude ELSE a.latitude END), 4326),'
+        '  ST_MakeEnvelope(:minx, :miny, :maxx, :maxy, 4326))')
+    params = {'minx': minx, 'miny': miny, 'maxx': maxx, 'maxy': maxy}
+    if category:
+        sql += ' AND r.category = :category'
+        params['category'] = category
+    return [row[0] for row in db.execute(text(sql), params).all()]
+
+
+def _community_map(db, category, minx, miny, maxx, maxy, zoom):
+    if spatial.postgis_active(db):
+        ids = _advisory_ids_in_bbox(db, category, minx, miny, maxx, maxy)
+        query = db.query(Advisory).filter(Advisory.id.in_(ids)) if ids else db.query(Advisory).filter(text('1 = 0'))
+        if category:
+            query = query.filter(Advisory.category == category)
+        rows = query.limit(1000).all()
+    else:
+        query = db.query(Advisory).filter(Advisory.state == 'published', Advisory.expires_at > now())
+        if category:
+            query = query.filter(Advisory.category == category)
+        rows = query.limit(1000).all()
+    features = []
+    for a in rows:
+        area = db.get(Area, a.area_id)
+        features.append({'type': 'Feature', 'id': a.id,
+                         'geometry': {'type': 'Point', 'coordinates': [area.longitude, area.latitude]},
+                         'properties': {'id': a.id, 'title': a.title, 'category': a.category,
+                                        'state': 'published', 'area_name': area.name,
+                                        'precision': 'community-centroid', 'kind': 'advisory'}})
+    features, clusters = _maybe_cluster(features, zoom)
+    return _map_body(features, clusters, [], 'db')
+
+
+def _advisory_ids_in_bbox(db, category, minx, miny, maxx, maxy):
+    """Published, unexpired advisories whose displayed point (the legacy area
+    centroid, matching the public marker) intersects the viewport."""
+    if not spatial.postgis_active(db):
+        return None
+    sql = (
+        'SELECT a.id FROM advisories a JOIN areas ar ON ar.id = a.area_id '
+        'WHERE a.state = :published AND a.expires_at > :cutoff '
+        'AND ST_Intersects(ST_SetSRID(ST_MakePoint(ar.longitude, ar.latitude), 4326),'
+        '  ST_MakeEnvelope(:minx, :miny, :maxx, :maxy, 4326))')
+    # expires_at is an ISO-8601 string column (legacy), so the "not expired"
+    # comparison is string-vs-string, the same one the ORM path runs.
+    params = {'published': 'published', 'cutoff': now(),
+              'minx': minx, 'miny': miny, 'maxx': maxx, 'maxy': maxy}
+    if category:
+        sql += ' AND a.category = :category'
+        params['category'] = category
+    return [row[0] for row in db.execute(text(sql), params).all()]
+
+
+def _overlay_areas(db, user, report_ids, minx, miny, maxx, maxy):
+    """Boundary polygons for the map: the viewing staff member's assigned areas
+    in the viewport (solid emphasis) plus the OSM areas containing the visible
+    reports (muted/dashed when outside the assignment)."""
+    if not spatial.postgis_active(db):
+        return []
+    layers: dict[int, dict] = {}
+    rows = db.execute(text(
+        'SELECT DISTINCT a.id, a.name, a.display_name, a.area_type,'
+        '       ST_AsGeoJSON(a.simplified_geom) AS g '
+        'FROM areas_osm a JOIN user_area_assignments u ON u.area_osm_id = a.id '
+        'WHERE u.user_id = :uid AND u.revoked_at IS NULL AND a.active '
+        'AND ST_Intersects(a.geom, ST_MakeEnvelope(:minx, :miny, :maxx, :maxy, 4326))'),
+        {'uid': user.id, 'minx': minx, 'miny': miny, 'maxx': maxx, 'maxy': maxy}).mappings().all()
+    for r in rows:
+        layers[r['id']] = {'assigned': True, 'name': r['name'], 'display_name': r['display_name'],
+                           'area_type': r['area_type'], 'geom': r['g']}
+    if report_ids:
+        rows = db.execute(text(
+            'SELECT DISTINCT a.id, a.name, a.display_name, a.area_type,'
+            '       ST_AsGeoJSON(a.simplified_geom) AS g '
+            'FROM report_areas ra JOIN areas_osm a ON a.id = ra.area_osm_id '
+            'WHERE ra.report_id = ANY(:ids) AND a.active'),
+            {'ids': report_ids}).mappings().all()
+        for r in rows:
+            layers.setdefault(r['id'], {'assigned': False, 'name': r['name'],
+                                        'display_name': r['display_name'],
+                                        'area_type': r['area_type'], 'geom': r['g']})
+    items = []
+    for aid, info in layers.items():
+        items.append({
+            'id': aid,
+            'name': info['name'] or info['display_name'] or f'OSM area {aid}',
+            'area_type': info['area_type'],
+            'assigned': info['assigned'],
+            'geometry': json.loads(info['geom']) if info.get('geom') else None,
+        })
+    # Payload guard: a whole-country viewport can cover many polygons; the
+    # simplified geometry is capped so the overlay never dominates the payload.
+    return items[:60]
+
+
+def _cluster_cell(zoom: int) -> float:
+    return CLUSTER_BASE_CELL * (2 ** max(0, CLUSTER_ZOOM - zoom - 1))
+
+
+def _maybe_cluster(features, zoom: int | None):
+    """Aggregate dense point cells into count clusters below CLUSTER_ZOOM.
+
+    Cluster centroids are snapped to the public generalisation grid so an
+    aggregate can never expose a finer position than its source points.
+    """
+    if not features or zoom is None or zoom >= CLUSTER_ZOOM:
+        return features, []
+    cell = _cluster_cell(zoom)
+    buckets: dict[tuple[int, int], list] = {}
+    for f in features:
+        lon, lat = f['geometry']['coordinates']
+        buckets.setdefault((math.floor(lon / cell), math.floor(lat / cell)), []).append(f)
+    clusters, kept = [], []
+    for (cx, cy), items in buckets.items():
+        if len(items) == 1:
+            kept.append(items[0])
+            continue
+        slon = sum(f['geometry']['coordinates'][0] for f in items) / len(items)
+        slat = sum(f['geometry']['coordinates'][1] for f in items) / len(items)
+        glon, glat = spatial.grid_point(slon, slat)
+        cats = Counter(f['properties']['category'] for f in items)
+        clusters.append({
+            'type': 'Feature', 'id': f'cluster-{cx}-{cy}',
+            'geometry': {'type': 'Point', 'coordinates': [glon, glat]},
+            'properties': {'id': f'cluster-{cx}-{cy}', 'kind': 'cluster', 'count': len(items),
+                           'category': cats.most_common(1)[0][0], 'categories': dict(cats),
+                           'precision': 'clustered'}})
+    return kept, clusters
 
 @router.get('/team/directory')
 def directory(user:User=Depends(current_user),db:Session=Depends(get_db)):
