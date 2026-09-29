@@ -68,7 +68,8 @@ def config():
     # ready, and a cached 'ready' would hide one that has failed.
     body=cache.cached('config',cfg.cache_ttl_seconds,lambda:
         {'name':'EcoGuard Uganda','demo_enabled':cfg.demo_enabled,'application_only':True,
-        'sms':cfg.sms_provider,'max_upload_mb':cfg.max_upload_mb,'languages':['en']})
+        'sms':cfg.sms_provider,'max_upload_mb':cfg.max_upload_mb,'languages':['en'],
+        'osm_attribution':cfg.osm_attribution,'osm_source_name':cfg.osm_source_name})
     ai_state=ai.status()
     return {**body,'image_assistance':ai_state['state'],'ai_model_version':ai_state['model_version']}
 

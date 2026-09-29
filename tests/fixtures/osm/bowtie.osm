@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6" generator="ecoguard-tests">
+  <!-- Deliberately broken geometry: a self-intersecting (bowtie) closed ring.
+       To keep the fixture small the four vertices form an X shape:
+       (31.0,0.0) -> (31.5,0.0) -> (31.0,0.5) -> (31.5,0.5) -> back. -->
+  <node id="1" lat="0.0" lon="31.0" version="1"/>
+  <node id="2" lat="0.0" lon="31.5" version="1"/>
+  <node id="3" lat="0.5" lon="31.0" version="1"/>
+  <node id="4" lat="0.5" lon="31.5" version="1"/>
+  <node id="5" lat="0.0" lon="31.0" version="1"/>
+  <way id="21" version="1">
+    <nd ref="1"/><nd ref="2"/><nd ref="3"/><nd ref="4"/><nd ref="5"/>
+    <tag k="boundary" v="protected_area"/>
+    <tag k="protect_class" v="4"/>
+    <tag k="protection_title" v="Bowtie Nature Reserve"/>
+    <tag k="name" v="Bowtie Nature Reserve"/>
+  </way>
+</osm>

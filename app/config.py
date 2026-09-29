@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     demo_enabled: bool = False
     enable_api_docs: bool = True
     auto_create_tables: bool = False
+    # OSM data attribution — surfaced in /config and on every /areas-osm response
+    # so the frontend can always render the required credit line.
+    osm_attribution: str = '© OpenStreetMap contributors, ODbL'
+    osm_source_name: str = 'OpenStreetMap (Geofabrik extract)'
 
     @property
     def origins(self):

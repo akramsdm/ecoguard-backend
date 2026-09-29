@@ -1,0 +1,70 @@
+{
+  "attribution": "© OpenStreetMap contributors, ODbL",
+  "source_name": "OpenStreetMap (Geofabrik uganda-latest extract)",
+  "name_alias_keys": ["official_name", "alt_name", "short_name", "int_name", "local_name"],
+  "simplify_tolerance_degrees": 0.01,
+  "min_area_sqm": 0,
+  "osm_types": ["way", "relation"],
+  "area_types": [
+    {
+      "type": "district",
+      "match_any": [
+        {"boundary": "administrative", "admin_level": ["4"]}
+      ]
+    },
+    {
+      "type": "national_park",
+      "match_any": [
+        {"boundary": "national_park"},
+        {"leisure": "national_park"},
+        {"protect_class": "2"}
+      ]
+    },
+    {
+      "type": "game_reserve",
+      "name_contains": ["Game Reserve", "Community Wildlife Area", "Wildlife Management Area", "Conservancy"],
+      "match_any": [
+        {"boundary": "protected_area"},
+        {"boundary": "game_reserve"},
+        {"leisure": "nature_reserve"}
+      ]
+    },
+    {
+      "type": "wildlife_reserve",
+      "name_contains": ["Wildlife Reserve", "Wildlife Sanctuary"],
+      "match_any": [
+        {"boundary": "protected_area"},
+        {"boundary": "wildlife_reserve"},
+        {"leisure": "nature_reserve"}
+      ]
+    },
+    {
+      "type": "forest_reserve",
+      "name_contains": ["Forest Reserve", "Forest Park", "Central Forest"],
+      "match_any": [
+        {"boundary": "protected_area"},
+        {"boundary": "forest"},
+        {"protect_class": "6"}
+      ]
+    },
+    {
+      "type": "nature_reserve",
+      "match_any": [
+        {"leisure": "nature_reserve"},
+        {"protect_class": "4"}
+      ]
+    },
+    {
+      "type": "protected_area",
+      "match_any": [
+        {"boundary": "protected_area"}
+      ]
+    },
+    {
+      "type": "other",
+      "match_any": [
+        {"protect_class": "*"}
+      ]
+    }
+  ]
+}

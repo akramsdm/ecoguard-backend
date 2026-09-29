@@ -97,15 +97,126 @@ python -m alembic upgrade head
 ```
 
 Use `python -m alembic revision --autogenerate -m 'message'` for future schema
-changes. The communities that reports must reference are seeded once with:
+changes. Note that the OSM geographic tables (`areas_osm`, `areas_osm_aliases`,
+`places`) intentionally live **outside** `Base.metadata` — the SQLite test
+harness cannot create PostGIS geometry DDL. They are managed exclusively by the
+hand-written `0003_osm_areas` migration, so autogenerate will propose dropping
+them; ignore those revisions. The same applies to `0004_spatial_authorization`
+(`user_area_assignments`, `report_areas`, the report geometry/location columns
+and their indexes), which is also hand-written for the same reason.
+
+The communities that reports must reference are seeded once with:
 
 ```bash
 docker compose run --rm -e DEMO_ENABLED=true api \
   python -m app.cli seed-demo --password '<12+ character password>'
 ```
 
+### OSM geographic areas (read-only)
+
+OSM-backed boundaries (districts, national parks, protected areas, nature/game/
+wildlife/forest reserves) are imported into `areas_osm` and exposed read-only at
+`GET /api/v1/areas-osm` (list: bbox, `area_type`, `q` text search, pagination)
+and `GET /api/v1/areas-osm/{id}` (full geometry). Both responses carry the OSM
+attribution string, which is also published in `GET /api/v1/config` under
+`osm_attribution` for the frontend.
+
+Importing is a manual, idempotent operation that never runs on API startup:
+
+```bash
+# Prereq: the venv has dev requirements (osmium is needed to read the extract)
+pip install -r requirements-dev.txt
+
+# Dry run first: reports classification + geometry stats without writing
+python -m app.import_osm_areas --extract var/osm/uganda-latest.osm.pbf --dry-run
+
+# Then apply (upserts by (osm_type, osm_id) — safe to re-run)
+python -m app.import_osm_areas --extract var/osm/uganda-latest.osm.pbf
+```
+
+The tag -> `area_type` mapping lives in `app/osm_areas_config.json` (confirmed
+against the Uganda extract), so the import scope is tunable without touching the
+importer. Assembly uses a disk-backed libosmium node-location index by default
+(`--location-index sparse_file_array`) so a whole country extract stays inside
+modest RAM; `flex_mem` is only for tiny extracts. Notable empirical findings
+baked into the config: Uganda districts are
+`boundary=administrative` **`admin_level=4`** (level 6 in the extract is
+Rwanda/DRC border data); national parks are mostly `boundary=protected_area` +
+`protect_class=2` (IUCN II); and `protect_class=15` in Uganda means wetlands,
+not game reserves. The `other` class is an explicit catch-all entry for
+`protect_class` values outside the IUCN set.
+`simplify_tolerance_degrees` defaults to `0.01` (≈1 km at Ugandan
+latitudes), tuned for country/regional web rendering while keeping small
+protected areas recognizable; the full-resolution `geom` is always stored.
+Invalid source geometries are repaired with `ST_MakeValid`; anything that
+remains invalid (or whose ring cannot even be assembled) is counted and listed
+by name in the import summary rather than dropped silently.
+
+The optional legacy-mapping proposal (Prompt 3 input) is produced read-only by:
+
+```bash
+python scripts/legacy_area_mapping.py --output var/legacy_area_mapping.csv
+```
+
 That prints the `reporter@`, `reviewer@`, `publisher@` and `admin@`
 `ecoguard.example.org` accounts that share the password you supplied.
+
+### Spatial authorization (area assignments + per-report containment)
+
+Migration `0004_spatial_authorization` adds the PostGIS-backed access model.
+All of it lives outside `Base.metadata` and is driven through raw SQL in
+`app/spatial.py`, gated on the engine dialect being PostgreSQL — the SQLite
+harness keeps its legacy exact-membership gating, so out-of-area staff there
+still get 404s.
+
+- **`user_area_assignments`** — append-only grants (`area_osm_id`, `assigned_by`,
+  `revoked_at`). Revoking a grant writes `revoked_at`; rows are never deleted.
+  The active grant is enforced by a partial unique index
+  (`uq_user_area_assignment_active ... WHERE revoked_at IS NULL`).
+- **`report_areas`** — the `areas_osm` polygons that a report's stored true
+  location intersects (`ST_Intersects` on `location_geom`). Client input never
+  feeds it; it is recomputed server-side on create/update/backfill.
+- **Report location** — every report carries one:
+  `share_location=true` stores the precise point (`location_geom`) and a
+  ~1 km grid-snapped public point (`public_geom`, generalised, `gps`);
+  coordinates without sharing become a grid-snapped point (`manual`); no
+  coordinates at all falls back to the chosen area's centroid (`area_only`).
+  `latitude`/`longitude` remain the *generalised display* coordinates; the
+  precise point never leaves `location_geom`.
+
+A user may act on a report when they hold an active assignment whose
+`area_osm_id` is in the report's `report_areas` — overlap with **any one**
+polygon suffices (e.g. a park *or* its containing district). Staff outside
+every assigned area see **redacted** read views and get 403 on mutations;
+they never see 404 for submitted+ content.
+
+```bash
+# one-time backfill of assignments + every existing report's location:
+python scripts/migrate_assignments.py \
+  --mapping var/osm/confirmed_legacy_mapping.json \
+  --report var/spatial_migration_report.txt
+```
+
+Route behaviour (PostGIS active; owner = report author; "in-area" = active
+assignment overlapping the report's areas):
+
+| Route | Owner/reporter | In-area staff | Out-of-area staff | Non-owner on a draft |
+|---|---|---|---|---|
+| `GET /reports`, `/reports/{id}` | 200 full | 200 full | 200 **redacted** | 404 |
+| `PATCH`/`PUT /reports/{id}` | 200 | — | 403 | 404 |
+| `POST /reports/{id}/submit` | 200 | — | 403 | 404 |
+| `POST .../review` · `/assign` · `/close` | 200 | 200 | 403 | 404 |
+| `GET .../evidence` · `.../messages` | 200 | 200 | 403 | 404 |
+| `POST .../messages` | 201 (owner/submitter/in-area) | 201 | 403 | 404 |
+| `GET /map?view=staff` · `/dashboard` | own cases | full rows | redacted rows | n/a |
+| `GET /advisories` (staff) | full | full | redacted | n/a |
+| `POST .../advisories/publish` · `POST .../retract` | 200 | 200 | 403 | n/a |
+| `GET /reports/export.csv` | own rows only | acting areas only | acting areas only | n/a |
+| `PATCH /admin/users/{id}` `POST /admin/users` | dual-write `User.areas` **and** assignments (by OSM area id) | | | |
+
+A redacted view omits `title`, `code`, `description`, `species`, contact
+fields, evidence, messages, reviewer notes, assignee and precise coordinates —
+out-of-area staff see only that a case exists at a generalised point.
 
 ## Administrators
 
@@ -155,12 +266,23 @@ API_PROXY_TARGET=http://localhost:8000 npm run dev   # http://localhost:5173
 ## Tests
 
 ```bash
-.venv/Scripts/python.exe -m pytest -q -p no:randomly
+.venv/Scripts/python.exe -m pytest -q
 ```
 
-115 tests, no model weights, no network and no PyTorch required — the classifier
-is stubbed. Real-model behaviour is covered separately by
+138 tests, no model weights, no network and no PyTorch required — the
+classifier is stubbed. Real-model behaviour is covered separately by
 `python scripts/speciesnet_smoke.py <image>`, which needs the ML extra.
+
+`tests/test_spatial_authorization.py` requires a running PostgreSQL with
+PostGIS: it creates throwaway scratch databases (the same pattern as
+`test_osm_areas.py`) and asserts the full new contract, including the
+out-of-area staff redacted-read/403 behaviours. The unit-feeding SQLite suite
+keeps exercising the legacy gating.
+
+A root `conftest.py` excludes `smoke_test.py` from collection — its
+module-level code sets `APP_ENV=development`, which silently enables the live
+auth rate limiter and makes full-suite runs fail with spurious 429s near the
+end.
 
 ## Deployment (Vercel)
 

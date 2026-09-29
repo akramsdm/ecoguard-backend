@@ -1,2 +1,5 @@
 -r requirements.txt
 pytest==9.1.1
+# OSM area importer: reads .osm.pbf/.osm extracts for `python -m app.import_osm_areas`.
+# The API itself never imports this module, so it stays out of requirements.txt.
+osmium==4.3.1
