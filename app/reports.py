@@ -1,11 +1,11 @@
 import csv, io, hashlib, json
 from uuid import uuid4
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, BackgroundTasks
 from sqlalchemy import or_, and_
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from .db import get_db
-from .models import User, Area, Report, Evidence, Review, CaseEvent, Message, Advisory, now
+from .models import User, Area, Report, Evidence, Review, CaseEvent, Message, Advisory, Prediction, now
 from .schemas import ReportWrite, ReportUpdate, VersionRequest, ReviewWrite, AssignWrite, CloseWrite, MessageWrite
 from .security import current_user, report_access, is_case_staff, require_role, check_version, audit
 from . import spatial
@@ -13,8 +13,16 @@ from .cache import touch
 
 router=APIRouter(prefix='/reports',tags=['Reports and cases'])
 
-def visible_query(db,user):
-    q=db.query(Report)
+def _dispatch_pending_safe():
+    try:
+        from .jobs import dispatch_pending
+        dispatch_pending()
+    except Exception:
+        pass
+
+
+def visible_query(db, user):
+    q = db.query(Report)
     if is_case_staff(user):
         if spatial.postgis_active(db):
             # Staff see every non-draft report; in-area rows render full and
@@ -31,7 +39,7 @@ def serialize_report(db,r,user,mode,detail=False):
 
 def report_view(db,r,user,detail=False):
     data={k:getattr(r,k) for k in ['id','code','client_id','category','title','description','species','area_id',
-        'observed_at','share_location','consent','state','version','assignee_id','created_at','updated_at']}
+        'observed_at','share_location','consent','state','version','assignee_id','created_at','updated_at','ai_priority']}
     data['is_owner']=r.owner_id==user.id
     area=db.get(Area,r.area_id)
     data['area_name']=area.name if area else r.area_id
@@ -76,7 +84,9 @@ def list_reports(user:User=Depends(current_user),db:Session=Depends(get_db),
     if area_id:query=query.filter(Report.area_id==area_id)
     if q:query=query.filter(or_(Report.title.ilike('%'+q+'%'),Report.code.ilike('%'+q+'%')))
     total=query.count()
-    rows=query.order_by(Report.created_at.desc()).offset((page-1)*page_size).limit(page_size).all()
+    from sqlalchemy import case
+    priority_order = case((Report.ai_priority=='high',0),(Report.ai_priority=='standard',1),(Report.ai_priority=='low',2),else_=3)
+    rows=query.order_by(priority_order, Report.created_at.asc()).offset((page-1)*page_size).limit(page_size).all()
     modes=spatial.visibility_map(db,user,rows)
     return {'items':[serialize_report(db,r,user,modes.get(r.id,'full')) for r in rows],
         'total':total,'page':page,'page_size':page_size}
@@ -125,10 +135,43 @@ def create(payload:ReportWrite,user:User=Depends(current_user),db:Session=Depend
     touch('reports.updated',r.id)
     return report_view(db,r,user,True)
 
+@router.get('/{report_id}/predictions')
+def report_predictions(report_id:str,user:User=Depends(current_user),db:Session=Depends(get_db)):
+    require_role(user,'reviewer','publisher','responder','admin')
+    r,_=report_access(db,user,report_id,True)
+    evidences=db.query(Evidence).filter_by(report_id=r.id).all()
+    items=[]
+    best=None
+    for e in evidences:
+        p=db.query(Prediction).filter_by(evidence_id=e.id).order_by(Prediction.created_at.desc()).first()
+        if p is None:
+            items.append({'evidence_id':e.id,'state':None,'species':None,'confidence':None,
+                'priority':None,'suggested_decision':None,'model_version':None,'created_at':None})
+            continue
+        items.append({'evidence_id':e.id,'state':p.state,'species':p.species,'confidence':p.confidence,
+            'priority':p.priority,'suggested_decision':p.suggested_decision,'model_version':p.model_version,
+            'created_at':p.created_at})
+        if p.state=='completed' and (best is None or (p.confidence or 0)>(best.confidence or 0)):
+            best=p
+    priority=None
+    if best is not None:
+        from .ai_rules import report_priority
+        priority=report_priority([x for x in [best]])
+        # compute highest across all completed
+        completed=[db.query(Prediction).filter_by(evidence_id=e.id).order_by(Prediction.created_at.desc()).first()
+                   for e in evidences]
+        completed=[p for p in completed if p is not None and p.state=='completed']
+        priority=__import__('app.ai_rules',fromlist=['report_priority']).report_priority(completed)
+    summary={'best_species':best.species if best else None,'best_confidence':best.confidence if best else None,
+        'best_prediction_id':best.id if best else None,'priority':priority,
+        'species_mismatch':bool(best and best.species and r.species and r.species!='Unknown animal' and best.species!=r.species)}
+    return {'items': items, 'summary': summary}
+
+
 @router.get('/{report_id}')
-def get_report(report_id:str,user:User=Depends(current_user),db:Session=Depends(get_db)):
-    report,mode=report_access(db,user,report_id,redacted=True)
-    return serialize_report(db,report,user,mode,detail=True)
+def get_report(report_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    report, mode = report_access(db, user, report_id, redacted=True)
+    return serialize_report(db, report, user, mode, detail=True)
 
 @router.put('/{report_id}')
 def update(report_id:str,payload:ReportUpdate,user:User=Depends(current_user),db:Session=Depends(get_db)):
@@ -154,16 +197,31 @@ def update(report_id:str,payload:ReportUpdate,user:User=Depends(current_user),db
     return report_view(db,r,user,True)
 
 @router.post('/{report_id}/submit')
-def submit(report_id:str,payload:VersionRequest,user:User=Depends(current_user),db:Session=Depends(get_db)):
+def submit(report_id:str,payload:VersionRequest,user:User=Depends(current_user),db:Session=Depends(get_db),background_tasks: BackgroundTasks=None):
     r,_=report_access(db,user,report_id,True)
     if r.owner_id!=user.id:raise HTTPException(403,'Only the reporter can submit this report.')
     # Safe retry after the first successful submission.
     if r.state=='submitted':return report_view(db,r,user,True)
     check_version(r,payload.version)
     if r.state not in ('draft','needs_evidence'):raise HTTPException(409,'This report cannot be submitted in its current state.')
-    r.state='submitted';event(db,r,user,'submitted','Queued for human review; not a public advisory.');db.commit()
-    touch('reports.updated',r.id)
-    return report_view(db,r,user,True)
+    r.state='submitted';event(db,r,user,'submitted','Queued for human review; not a public advisory.')
+    # Enqueue image assistance for every attached evidence image. Never blocks submit.
+    try:
+        from .evidence import enqueue_prediction
+        for e in db.query(__import__('app.models', fromlist=['Evidence']).Evidence).filter_by(report_id=r.id).all():
+            try:
+                enqueue_prediction(db, e, user)
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).warning('enqueue prediction failed: %s', exc)
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning('prediction enqueue unavailable: %s', exc)
+    db.commit()
+    if background_tasks is not None:
+        background_tasks.add_task(_dispatch_pending_safe)
+    touch('reports.updated', r.id)
+    return report_view(db, r, user, True)
 
 @router.post('/{report_id}/review')
 def review(report_id:str,payload:ReviewWrite,user:User=Depends(current_user),db:Session=Depends(get_db)):
@@ -174,7 +232,16 @@ def review(report_id:str,payload:ReviewWrite,user:User=Depends(current_user),db:
     if r.assignee_id and r.assignee_id!=user.id:raise HTTPException(403,'This case is assigned to a different reviewer.')
     r.state=payload.decision
     if payload.species is not None:r.species=payload.species
-    db.add(Review(report_id=r.id,reviewer_id=user.id,decision=payload.decision,notes=payload.notes,species=payload.species))
+    # Save AI snapshot from the best completed prediction, if any.
+    ai_pred_id=None;ai_species=None;ai_conf=None
+    try:
+        preds=db.query(Prediction).join(Evidence, Prediction.evidence_id==Evidence.id).filter(Evidence.report_id==r.id, Prediction.state=='completed').order_by(Prediction.confidence.desc()).first()
+        if preds:
+            ai_pred_id=preds.id;ai_species=preds.species;ai_conf=preds.confidence
+    except Exception:
+        pass
+    db.add(Review(report_id=r.id,reviewer_id=user.id,decision=payload.decision,notes=payload.notes,species=payload.species,
+        ai_prediction_id=ai_pred_id,ai_species=ai_species,ai_confidence=ai_conf))
     event(db,r,user,payload.decision,payload.notes);db.commit()
     touch('reports.updated',r.id)
     return report_view(db,r,user,True)

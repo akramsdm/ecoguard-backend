@@ -25,13 +25,26 @@ def process_job(job_id):
         try:
             if job.kind=='prediction':
                 from .ai import infer
+                from .ai_rules import evaluate, report_priority
                 p=db.get(Prediction,job.aggregate_id);e=db.get(Evidence,p.evidence_id)
                 result=infer(storage.get(e.storage_key))
                 for k,v in result.items():setattr(p,k,v)
+                priority, suggested = evaluate(result.get('species'), result.get('confidence'), result.get('state'))
+                p.priority = priority
+                p.suggested_decision = suggested
                 job.state='done'
+                # update report-level priority if attached
+                if e.report_id:
+                    r = db.get(__import__('app.models', fromlist=['Report']).Report, e.report_id)
+                    if r is not None:
+                        preds = db.query(Prediction).filter(Prediction.evidence_id.in_(
+                            [ev.id for ev in db.query(__import__('app.models', fromlist=['Evidence']).Evidence).filter_by(report_id=r.id).all()]
+                        )).all()
+                        # include just-completed
+                        r.ai_priority = report_priority(preds)
+                audit(db, db.get(User, e.owner_id), 'prediction.completed', p.id)
                 # The result is auditable: the row points at the Prediction holding
                 # state, species, confidence and model_version.
-                audit(db,db.get(User,e.owner_id),'prediction.completed',p.id)
                 from .cache import publish
                 publish({'type':'prediction.updated','object_id':p.id,'event':'prediction.updated'})
             elif job.kind=='advisory':

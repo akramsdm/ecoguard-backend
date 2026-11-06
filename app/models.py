@@ -54,6 +54,7 @@ class Report(Base):
     share_location: Mapped[bool] = mapped_column(Boolean, default=False)
     consent: Mapped[bool] = mapped_column(Boolean, default=False)
     state: Mapped[str] = mapped_column(String(24), default='draft', index=True)
+    ai_priority: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
     version: Mapped[int] = mapped_column(Integer, default=1)
     assignee_id: Mapped[str | None] = mapped_column(ForeignKey('users.id'), nullable=True)
     created_at: Mapped[str] = mapped_column(String(40), default=now, index=True)
@@ -84,6 +85,8 @@ class Prediction(Base):
     confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     boxes: Mapped[list] = mapped_column(JSON, default=list)
     model_version: Mapped[str] = mapped_column(String(100), default='not-configured')
+    priority: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    suggested_decision: Mapped[str | None] = mapped_column(String(24), nullable=True)
     explanation: Mapped[str] = mapped_column(Text, default='Awaiting image assistance.')
     created_at: Mapped[str] = mapped_column(String(40), default=now)
 
@@ -95,6 +98,9 @@ class Review(Base):
     decision: Mapped[str] = mapped_column(String(24))
     notes: Mapped[str] = mapped_column(Text)
     species: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    ai_prediction_id: Mapped[str | None] = mapped_column(ForeignKey('predictions.id'), nullable=True)
+    ai_species: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    ai_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[str] = mapped_column(String(40), default=now)
 
 class CaseEvent(Base):
