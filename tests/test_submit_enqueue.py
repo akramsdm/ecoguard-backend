@@ -4,7 +4,7 @@ from PIL import Image
 import pytest
 
 from app.db import Base, engine, SessionLocal
-from app.models import Area, Outbox, Prediction
+from app.models import Area, Outbox, Prediction, Audit
 from app.security import limiter
 from tests.test_predictions_api import register, upload, ensure_area, image_bytes
 
@@ -39,28 +39,6 @@ def stub_runtime(monkeypatch):
     ai._load_error = None
 
 
-def test_submit_enqueues_one_prediction_job(client):
-    register(client)
-    ensure_area()
-    evidence = upload(client, image_bytes()).json()
-    report = client.post(
-        "/api/v1/reports",
-        json={"client_id": "client-1", "area_id": "community-a", "category": "wildlife",
-              "title": "title", "description": "description text here", "evidence_ids": [evidence["id"]],
-              "observed_at": "2026-01-01T00:00:00Z", "consent": True},
-    )
-    assert report.status_code == 201, report.text
-    rid = report.json()["id"]
-    ver = report.json()["version"]
-    r = client.post(f"/api/v1/reports/{rid}/submit", json={"version": ver})
-    assert r.status_code == 200, r.text
-    with SessionLocal() as db:
-        jobs = db.query(Outbox).filter_by(kind="prediction").count()
-        preds = db.query(Prediction).filter_by(evidence_id=evidence["id"]).count()
-    assert jobs == 1
-    assert preds == 1
-
-
 def _make_report(client, evidence_ids):
     ensure_area()
     report = client.post(
@@ -71,6 +49,18 @@ def _make_report(client, evidence_ids):
     )
     assert report.status_code == 201, report.text
     return report.json()
+
+
+def test_submit_enqueues_one_prediction_job(client):
+    register(client)
+    ensure_area()
+    evidence = upload(client, image_bytes()).json()
+    report = _make_report(client, [evidence["id"]])
+    r = client.post(f"/api/v1/reports/{report['id']}/submit", json={"version": report["version"]})
+    assert r.status_code == 200
+    with SessionLocal() as db:
+        assert db.query(Outbox).filter_by(kind="prediction").count() == 1
+        assert db.query(Prediction).filter_by(evidence_id=evidence["id"]).count() == 1
 
 
 def test_submit_two_images_enqueues_two(client):
@@ -105,8 +95,7 @@ def test_submit_twice_no_duplicates(client):
     report = _make_report(client, [evidence["id"]])
     r1 = client.post(f"/api/v1/reports/{report['id']}/submit", json={"version": report["version"]})
     assert r1.status_code == 200
-    r2 = client.post(f"/api/v1/reports/{report['id']}/submit", json={"version": report["version"] + 1})
-    # second submit is a safe retry; state already submitted
+    r2 = client.post(f"/api/v1/reports/{report['id']}/submit", json={"version": report["version"]})
     assert r2.status_code in (200, 409)
     with SessionLocal() as db:
         assert db.query(Outbox).filter_by(kind="prediction").count() == 1
@@ -130,3 +119,33 @@ def test_submit_enqueue_failure_does_not_block(client, monkeypatch):
         from app.models import Report
         rr = db.get(Report, report["id"])
         assert rr.state == "submitted"
+
+
+def test_submit_and_manual_prediction_are_idempotent(client, monkeypatch):
+    import app.ai as ai_mod
+
+    class FC:
+        def __init__(self):
+            self.classes = ["african elephant"]
+            self.scores = [0.94]
+        def preprocess(self, image, bboxes=None, resize=True):
+            return {"shape": (image.width, image.height)}
+        def predict(self, filepath, img):
+            return {"filepath": filepath, "classifications": {"classes": self.classes, "scores": self.scores}}
+
+    fake = FC()
+    monkeypatch.setattr(ai_mod, "_classifier", fake, raising=False)
+    ai_mod._load = lambda: fake
+    register(client)
+    ensure_area()
+    evidence = upload(client, image_bytes()).json()
+    report = _make_report(client, [evidence["id"]])
+    r = client.post(f"/api/v1/reports/{report['id']}/submit", json={"version": report["version"]})
+    assert r.status_code == 200
+    r2 = client.post("/api/v1/predictions", json={"evidence_id": evidence["id"]})
+    assert r2.status_code in (200, 202)
+    with SessionLocal() as db:
+        preds = db.query(Prediction).filter_by(evidence_id=evidence["id"]).all()
+        assert len(preds) == 1
+        audits = db.query(Audit).filter_by(action="prediction.completed").all()
+        assert len(audits) == 1
